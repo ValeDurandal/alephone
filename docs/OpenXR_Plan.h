@@ -43,3 +43,37 @@
 // Mapping to current code:
 //   Current:  player camera → left/right origin offsets → render_view into FBOs → composite to window
 //   Future:   OpenXR views  → set view_data from pose+FOV → render_view into swapchain image → submit
+// 
+// Notes:
+// 
+//	 OpenGL context is created in screen.cpp around the
+//	 SDL_CreateWindow + SDL_GL_CreateContext(main_screen) block
+//	 (when acceleration == _opengl_acceleration).
+//	 OpenXR session must be created AFTER that succeeds.
+//
+// After successful SDL_GL_CreateContext(main_screen)[and glewInit on Win32]:
+//
+// Pseudocode only — not implemented
+//	 SDL_SysWMinfo wmInfo;
+//	 SDL_VERSION(&wmInfo.version);
+//	 SDL_GetWindowWMInfo(main_screen, &wmInfo);
+//	 HDC   hDC = GetDC(wmInfo.info.win.window);
+//	 HGLRC hGLRC = wglGetCurrentContext();
+//
+// Then eventually:
+// XrGraphicsBindingOpenGLWin32KHR binding = { ... hDC, hGLRC ... };
+// xrCreateSession(..., &binding, ...);
+//
+// ## Environment & insertion point (filled in)
+//
+// -**Active OpenXR runtime : **SteamVR
+// `C:\Program Files(x86)\Steam\steamapps\common\SteamVR\steamxr_win64.json`
+// - **Also available : **Meta Quest Link / Oculus
+// - **OpenGL context created in : **`Source_Files/RenderOther / screen.cpp`
+// Sequence: `SDL_CreateWindow` (with `SDL_WINDOW_OPENGL`) → `SDL_GL_CreateContext(main_screen)` → `glewInit()` (Win32)
+// -**OpenXR session must start after : **that context creation succeeds(and only when using OpenGL acceleration)
+// - **Graphics binding(Windows) will need : **
+// -`HDC`  via `SDL_GetWindowWMInfo` → `GetDC(hwnd)`
+// - `HGLRC` via `wglGetCurrentContext()` after the context is current
+// - **First implementation milestone(unchanged) :**
+// Create OpenXR instance + session bound to the existing GL context, then shut down cleanly.No headset rendering yet.
