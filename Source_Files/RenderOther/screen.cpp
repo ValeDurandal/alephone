@@ -38,6 +38,7 @@
 #include "OGL_Blitter.h"
 #include "OGL_Faders.h"
 #include "OGL_Textures.h"
+#include "OGL_FBO.h"
 #endif
 
 #include "world.h"
@@ -140,6 +141,7 @@ static void DisplayPosition(SDL_Surface *s);
 static void DisplayMessages(SDL_Surface *s);
 static void DrawSurface(SDL_Surface *s, SDL_Rect &dest_rect, SDL_Rect &src_rect);
 static void clear_screen_margin();
+
 
 SDL_PixelFormat pixel_format_16, pixel_format_32;
 
@@ -1435,13 +1437,122 @@ void render_screen(short ticks_elapsed)
         clear_screen_margin();
     
 	// Update software_render_dest
+	//if (OGL_IsActive())
+	//	software_render_dest.clear();
+	//else if (software_render_dest.empty() || ViewChangedSize)
+	//	software_render_dest = bitmap_definition_of_sdl_surface(world_pixels);
+
+#ifdef HAVE_OPENGL
 	if (OGL_IsActive())
-		software_render_dest.clear();
-	else if (software_render_dest.empty() || ViewChangedSize)
-		software_render_dest = bitmap_definition_of_sdl_surface(world_pixels);
-	
-	// Render world view
-	render_view(world_view, software_render_dest.get());
+	{
+		// Experimental dual-FBO side-by-side stereo prototype
+		// - Separation: 72
+		// - Weapons-in-hand: forced off
+		// - HUD: mono, drawn after composite
+		// - Known: rare distant glitches, free-view only, no asymmetric frustums yet
+		// Toggle with g_enable_stereo_prototype
+
+		static bool g_enable_stereo_prototype = true;
+
+		if (!g_enable_stereo_prototype)
+		{
+			render_view(world_view, software_render_dest.get());
+		}
+		else
+		{
+			static FBO* left_fbo = nullptr;
+			static FBO* right_fbo = nullptr;
+			static GLuint last_w = 0, last_h = 0;
+
+			// Save state we will modify
+			short saved_width = world_view->screen_width;
+			short saved_std = world_view->standard_screen_width;
+			world_point3d saved_origin = world_view->origin;
+
+			// Determine size
+			GLint vp[4];
+			glGetIntegerv(GL_VIEWPORT, vp);
+			GLuint w = vp[2] ? vp[2] : ViewRect.w;
+			GLuint h = vp[3] ? vp[3] : ViewRect.h;
+			GLuint half_w = w / 2;
+
+			// Recreate FBOs on size change
+			if (!left_fbo || half_w != last_w || h != last_h)
+			{
+				delete left_fbo;
+				delete right_fbo;
+				left_fbo = new FBO(half_w, h);
+				right_fbo = new FBO(half_w, h);
+				last_w = half_w;
+				last_h = h;
+			}
+
+			const int eye_separation = 72;
+
+			// Helper lambda or just repeat cleanly for each eye
+			auto render_eye = [&](FBO* fbo, int sign)
+				{
+					world_view->origin = saved_origin;
+					world_view->origin.x += sign * (eye_separation * sine_table[world_view->yaw]) / TRIG_MAGNITUDE;
+					world_view->origin.y -= sign * (eye_separation * cosine_table[world_view->yaw]) / TRIG_MAGNITUDE;
+
+					world_view->screen_width = half_w;
+					world_view->standard_screen_width = half_w;
+					initialize_view_data(world_view);
+
+					const int frustum_shift = 20;   // start modest; we can tune later
+
+					// Left eye (sign = -1)
+					world_view->half_screen_width = 336 - frustum_shift;   // or (half_w/2) - frustum_shift
+
+					// Right eye (sign = +1)
+					world_view->half_screen_width = 336 + frustum_shift;
+
+					world_view->show_weapons_in_hand = false;
+
+					fbo->activate(true);
+					render_view(world_view, software_render_dest.get());
+					fbo->deactivate();
+					glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+				};
+
+			// Left eye = -1, Right eye = +1
+			render_eye(left_fbo, -1);
+			render_eye(right_fbo, +1);
+
+			// Composite side-by-side
+			glViewport(vp[0], vp[1], vp[2], vp[3]);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+			glDisable(GL_DEPTH_TEST);
+
+			glViewport(vp[0], vp[1], half_w, h);
+			left_fbo->prepare_drawing_mode();
+			left_fbo->draw();
+			left_fbo->reset_drawing_mode();
+
+			glViewport(vp[0] + half_w, vp[1], half_w, h);
+			right_fbo->prepare_drawing_mode();
+			right_fbo->draw();
+			right_fbo->reset_drawing_mode();
+
+			glEnable(GL_DEPTH_TEST);
+			glViewport(vp[0], vp[1], vp[2], vp[3]);
+
+			// Restore view state
+			world_view->origin = saved_origin;
+			world_view->screen_width = saved_width;
+			world_view->standard_screen_width = saved_std;
+			initialize_view_data(world_view);
+		}
+	}
+	else
+	{
+		render_view(world_view, software_render_dest.get());
+	}
+#endif
+	// Original line, just in case:
+	//render_view(world_view, software_render_dest.get());
 
     // clear Lua drawing from previous frame
     // (SDL is slower if we do this before render_view)
