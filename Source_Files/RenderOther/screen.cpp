@@ -33,6 +33,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <string.h>
+#include <openxr/openxr.h>
+
+#include "OpenXR_Smoke.h"
+
 #ifdef HAVE_OPENGL
 #include "OGL_Headers.h"
 #include "OGL_Blitter.h"
@@ -73,6 +78,7 @@
 #include "shell_options.h"
 
 #include <algorithm>
+
 
 #if defined(__WIN32__) || (defined(__MACH__) && defined(__APPLE__))
 #define MUST_RELOAD_VIEW_CONTEXT
@@ -971,7 +977,18 @@ static void change_screen_mode(int width, int height, int depth, bool nogl, bool
 		}
 #if defined (__WIN32__) && (HAVE_OPENGL)
 		glewInit();
+
+		Aleph_OpenXR_SmokeTest();
 #endif
+
+
+// -------------------------------------------------------------------------
+// FUTURE OPENXR HOOK
+// OpenXR instance/session init belongs here, AFTER the GL context is current.
+// Need: HDC (from SDL_GetWindowWMInfo + GetDC) and HGLRC (wglGetCurrentContext).
+// See docs/OpenXR_Plan.md — first milestone is instance + session only.
+// -------------------------------------------------------------------------
+
 		if (!OGL_CheckExtension("GL_ARB_vertex_shader") || !OGL_CheckExtension("GL_ARB_fragment_shader") || !OGL_CheckExtension("GL_ARB_shader_objects") || !OGL_CheckExtension("GL_ARB_shading_language_100"))
 		{
 			logWarning("OpenGL (Shader) renderer is not available");

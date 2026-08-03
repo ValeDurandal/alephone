@@ -34,3 +34,4 @@ lib*.a
 /*.tar.bz2
 
 .vscode/
+/VisualStudio/AlephOne/openxr_smoke.txt

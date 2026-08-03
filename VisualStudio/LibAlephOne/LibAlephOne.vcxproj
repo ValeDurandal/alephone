@@ -140,6 +140,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
+    <IncludePath>C:\src\vcpkg\installed\x64-windows\include;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
@@ -418,6 +419,7 @@
     <ClCompile Include="..\..\Source_Files\CSeries\csstrings.cpp" />
     <ClCompile Include="..\..\Source_Files\CSeries\FilmProfile.cpp" />
     <ClCompile Include="..\..\Source_Files\CSeries\mytm_sdl.cpp" />
+    <ClCompile Include="..\..\Source_Files\RenderOther\OpenXR_Smoke.cpp" />
     <ClCompile Include="..\..\Source_Files\Videos\Movie.cpp" />
     <ClCompile Include="..\..\Source_Files\Files\AStream.cpp" />
     <ClCompile Include="..\..\Source_Files\Files\crc.cpp" />

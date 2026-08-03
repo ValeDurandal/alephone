@@ -77,3 +77,31 @@
 // - `HGLRC` via `wglGetCurrentContext()` after the context is current
 // - **First implementation milestone(unchanged) :**
 // Create OpenXR instance + session bound to the existing GL context, then shut down cleanly.No headset rendering yet.
+//
+//
+// ## Progress summary (as of 2026-08-03)
+//
+// ### Dual - FBO stereo(monitor side - by - side)
+// - Optional path controlled by `g_enable_stereo_prototype` in `screen.cpp`
+// - Left / right eye offsets(right - vector), separation 72
+// - Half - width FBOs + per - eye `initialize_view_data` for improved aspect
+// - Weapons - in - hand forced off while stereo is on; HUD remains mono on top
+// - Rare distant visual glitches still possible but much reduced
+// - Free - view(cross - eyed) only for now — no headset presentation yet
+//
+// ### OpenXR foundation
+// - **Runtime:**SteamVR active(`steamxr_win64.json`)
+//	- **Loader:**`openxr-loader` via vcpkg; `openxr_loader.dll` (+deps) beside the exe for debug runs
+//	- **GL context landmark : **`screen.cpp` — after `SDL_GL_CreateContext` + `glewInit()`
+//	- **Graphics binding(Windows, later) :**`HDC` via `SDL_GetWindowWMInfo` + `GetDC`; `HGLRC` via `wglGetCurrentContext`
+//	- **Smoke test : **`OpenXR_Smoke.cpp` / `.h`, called once after `glewInit`
+//	- `xrCreateInstance` succeeds with `XR_MAKE_VERSION(1, 0, 0)`
+//	- `xrGetSystem(HMD)` returns `-35` (`XR_ERROR_FORM_FACTOR_UNAVAILABLE`) when no headset — expected
+//	- Instance destroyed cleanly
+//		- **Not done yet : **`xrCreateSession` with OpenGL binding, swapchains, frame loop, or feeding poses into `view_data`
+
+//		### Next milestones
+//		1. Connect HMD(SteamVR + Link / Air Link) and confirm `xrGetSystem` returns 0
+//		2. Create / destroy session with `XrGraphicsBindingOpenGLWin32KHR`
+//		3. Swapchains + minimal frame loop(clear only)
+//		4. Render existing stereo path into OpenXR swapchain images using runtime poses / FOVs
