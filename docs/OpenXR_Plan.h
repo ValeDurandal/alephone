@@ -99,9 +99,41 @@
 //	- `xrGetSystem(HMD)` returns `-35` (`XR_ERROR_FORM_FACTOR_UNAVAILABLE`) when no headset — expected
 //	- Instance destroyed cleanly
 //		- **Not done yet : **`xrCreateSession` with OpenGL binding, swapchains, frame loop, or feeding poses into `view_data`
-
+//
 //		### Next milestones
 //		1. Connect HMD(SteamVR + Link / Air Link) and confirm `xrGetSystem` returns 0
 //		2. Create / destroy session with `XrGraphicsBindingOpenGLWin32KHR`
 //		3. Swapchains + minimal frame loop(clear only)
 //		4. Render existing stereo path into OpenXR swapchain images using runtime poses / FOVs
+//
+//
+// ## Progress summary (as of 2026-08-04)
+//
+// ### Dual - FBO stereo(monitor side - by - side)
+//  - Optional path : `g_enable_stereo_prototype` in `screen.cpp`
+//  - Eye offsets(right - vector), separation 72
+//  - Half - width FBOs + per - eye `initialize_view_data`
+//  - Weapons off in stereo; HUD mono on top
+//  - Free - view only on monitor for now
+//
+// ### OpenXR foundation — COMPLETE through session
+//  - **Runtime:**SteamVR(`steamxr_win64.json`), tested with Quest via Air Link
+//    - **Loader:**vcpkg `openxr-loader`; DLLs beside exe for debug
+//    - **GL context landmark : **`screen.cpp` after `SDL_GL_CreateContext` + `glewInit()`
+//    - **Smoke test : **`OpenXR_Smoke.cpp` / `.h`
+//    - `xrCreateInstance` OK(API 1.0.0)
+//    - `xrGetSystem` OK when HMD present(−35 without headset is expected)
+//    - `xrGetOpenGLGraphicsRequirementsKHR` OK
+//    - `xrCreateSession` OK with `XrGraphicsBindingOpenGLWin32KHR` (current `hDC` / `hGLRC`)
+//      - Session + instance destroyed cleanly
+//      - **Environment notes : **
+//      -Run Steam / SteamVR / Aleph One at the same elevation(not as Admin)
+//      - Extra OpenXR API layers can be disabled under
+//      `HKLM\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit` (DWORD 1 = disabled)
+//
+// ### Next milestones
+//     1. Create OpenXR swapchains(runtime - recommended size / format)
+//     2. Minimal frame loop : wait / begin → acquire → clear color → release → end
+//     (solid color in the headset)
+//     3. Render existing stereo path into swapchain images
+//     4. Later : use `xrLocateViews` poses / FOVs instead of invented eye offsets
