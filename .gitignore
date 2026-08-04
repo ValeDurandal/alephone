@@ -35,3 +35,4 @@ lib*.a
 
 .vscode/
 /VisualStudio/AlephOne/openxr_smoke.txt
+/VisualStudio/AlephOne/openxr_session.txt

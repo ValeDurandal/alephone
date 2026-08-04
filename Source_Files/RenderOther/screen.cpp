@@ -930,6 +930,14 @@ static void change_screen_mode(int width, int height, int depth, bool nogl, bool
 			main_render = NULL;
 		}
 	if (main_screen != NULL) {
+#if defined (__WIN32__) && (HAVE_OPENGL)
+		// Tear down the OpenXR session before this window's GL context dies.
+		// SDL destroys the GL context with the window, which would invalidate
+		// our graphics binding + scratch FBO. No-op if never initialized.
+		// This also covers video-mode changes: after the new context is made,
+		// Aleph_OpenXR_Init() (below) re-binds cleanly since g_active is reset.
+		Aleph_OpenXR_Shutdown();
+#endif
 		Uint32 window_id = SDL_GetWindowID(main_screen);
 	    SDL_DestroyWindow(main_screen);
 		main_screen = NULL;

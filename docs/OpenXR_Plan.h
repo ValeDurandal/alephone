@@ -137,3 +137,51 @@
 //     (solid color in the headset)
 //     3. Render existing stereo path into swapchain images
 //     4. Later : use `xrLocateViews` poses / FOVs instead of invented eye offsets
+//
+//
+// ## Progress summary (as of 2026-08-04) — Steps A & B COMPLETE
+//
+// ### Step A — swapchain creation (verified)
+//  - Extended the smoke test: enumerate view-config views, choose color
+//    format, create per-eye swapchains, enumerate images, then destroy.
+//  - Confirmed on Quest via SteamVR: 2 views @ 2064x2272,
+//    format 0x8c43 (GL_SRGB8_ALPHA8), 3 images per swapchain.
+//
+// ### Step B — persistent session + minimal frame loop (verified: SOLID TEAL)
+//  - **New helper:** `OpenXR_Session.cpp` / `.h`
+//    (`Aleph_OpenXR_Init` / `Aleph_OpenXR_Frame` / `Aleph_OpenXR_Shutdown`).
+//    Self-contained: owns its instance/session/space/swapchains + scratch FBO.
+//    Every entry point is a no-op if init failed → cannot break monitor path.
+//  - **Init** (after `glewInit`, replacing the one-shot smoke call):
+//    instance → system → GL reqs → session → view-config → format →
+//    swapchains → `xrCreateReferenceSpace(LOCAL)` → scratch FBO.
+//    Does NOT begin the session; `xrBeginSession` happens on state READY.
+//  - **Frame** (driven from `MainScreenSwap()` after `SDL_GL_SwapWindow`):
+//    `xrPollEvent` (BeginSession@READY / EndSession@STOPPING) →
+//    `xrWaitFrame` → `xrBeginFrame` → `xrLocateViews` → per eye
+//    acquire / wait / clear-to-teal into scratch FBO / release →
+//    `xrEndFrame` with a projection layer. Blend = OPAQUE, space = LOCAL.
+//  - **Teardown wired twice, idempotent:**
+//    - `screen.cpp` before `SDL_DestroyWindow` (window/GL-context recreation
+//      on video-mode changes; also lets the following Init re-bind cleanly).
+//    - `shell.cpp` `shutdown_application()` before `SDL_Quit()` (clean exit).
+//  - **Gotcha fixed:** originally gated rendering on `posesValid` (position +
+//    orientation valid bits). Before tracking locks, those bits are clear, so
+//    we submitted empty frames (layerCount 0) → blank headset even though the
+//    session still reached FOCUSED. Now we render whenever `xrLocateViews`
+//    succeeds and *sanitize* the pose (identity orientation / zero position)
+//    when bits are off — a projection layer only needs a structurally valid
+//    pose, not a good lock. Teal now shows the moment the session submits.
+//  - **Known cost (expected):** `xrWaitFrame` blocks the main thread to the
+//    headset cadence, and Frame() runs off every `MainScreenSwap()`, so the
+//    game paces to ~HMD refresh and feels heavier. Fine for this milestone;
+//    decouple XR frame timing from the monitor present in a later step.
+//  - **Monitor dual-FBO stereo path: untouched.**
+//
+// ### Next milestones
+//     1. (done) swapchains
+//     2. (done) minimal frame loop — solid color in headset
+//     3. Render the existing per-eye game view into the swapchain images
+//        instead of a flat clear.
+//     4. Drive `view_data` from `xrLocateViews` pose/FOV, replacing the
+//        invented eye offsets from the dual-FBO prototype.

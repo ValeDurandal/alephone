@@ -63,7 +63,9 @@ bool           g_active         = false;   // Init() fully succeeded
 
 GLuint g_fbo = 0;
 
-FILE*  g_log = nullptr;
+FILE*  g_log       = nullptr;
+int    g_cycle     = 0;    // Init count this process (detects re-init churn)
+long   g_frameNum  = 0;    // frames since this cycle began rendering
 
 void L(const char* fmt, ...)
 {
@@ -267,8 +269,12 @@ bool Aleph_OpenXR_Init()
 {
     if (g_active) return true;
 
+    // Open once per process (truncate); keep it open across Init/Shutdown
+    // cycles so re-init churn is visible instead of truncated away.
     if (!g_log) fopen_s(&g_log, "openxr_session.txt", "w");
-    L("init: start");
+    ++g_cycle;
+    g_frameNum = 0;
+    L("init: start (cycle %d)", g_cycle);
 
     if (!CreateInstanceAndSystem() ||
         !CreateSession() ||
@@ -306,6 +312,12 @@ void Aleph_OpenXR_Frame()
     const XrCompositionLayerBaseHeader* layers[1] = { nullptr };
     uint32_t layerCount = 0;
 
+    // Diagnostics for this frame.
+    XrResult locateResult = XR_SUCCESS;
+    XrViewStateFlags viewFlags = 0;
+    bool  posesValid   = false;
+    int   eyesRendered = 0;
+
     if (frameState.shouldRender) {
         // Locate the eye views for this frame's predicted display time.
         const uint32_t viewCapacity = (uint32_t)g_configViews.size();
@@ -317,15 +329,19 @@ void Aleph_OpenXR_Frame()
         locate.space                 = g_space;
 
         uint32_t viewCountOut = 0;
-        XrResult r = xrLocateViews(g_session, &locate, &viewState,
+        locateResult = xrLocateViews(g_session, &locate, &viewState,
             viewCapacity, &viewCountOut, views.data());
+        viewFlags = viewState.viewStateFlags;
 
-        const bool posesValid =
-            XR_SUCCEEDED(r) &&
-            (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
-            (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+        const bool orientationValid = (viewFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+        const bool positionValid    = (viewFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+        posesValid = orientationValid && positionValid;
 
-        if (posesValid) {
+        // Render whenever the locate call itself succeeded. A projection layer
+        // only needs a *structurally* valid pose, not a good tracking lock, so
+        // we sanitize instead of skipping — the solid color then shows even
+        // before/without full tracking (headset still establishing, on a desk).
+        if (XR_SUCCEEDED(locateResult) && viewCountOut > 0) {
             projViews.resize(viewCountOut);
             for (uint32_t i = 0; i < viewCountOut; ++i) {
                 SwapchainInfo& sc = g_swapchains[i];
@@ -343,10 +359,18 @@ void Aleph_OpenXR_Frame()
 
                 XrSwapchainImageReleaseInfo rel{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
                 xrReleaseSwapchainImage(sc.handle, &rel);
+                ++eyesRendered;
+
+                // Sanitize the pose so xrEndFrame always gets a valid quaternion.
+                XrPosef pose = views[i].pose;
+                if (!orientationValid)
+                    pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+                if (!positionValid)
+                    pose.position = { 0.0f, 0.0f, 0.0f };
 
                 XrCompositionLayerProjectionView& pv = projViews[i];
                 pv = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
-                pv.pose = views[i].pose;
+                pv.pose = pose;
                 pv.fov  = views[i].fov;
                 pv.subImage.swapchain               = sc.handle;
                 pv.subImage.imageArrayIndex         = 0;
@@ -368,7 +392,19 @@ void Aleph_OpenXR_Frame()
     endInfo.environmentBlendMode = g_blendMode;
     endInfo.layerCount           = layerCount;
     endInfo.layers               = layers;
-    xrEndFrame(g_session, &endInfo);
+    XrResult endResult = xrEndFrame(g_session, &endInfo);
+
+    // Quiet diagnostics: log the first few frames of each cycle (enough to
+    // confirm the loop is submitting real layers), plus any frame where
+    // xrEndFrame reports an error. No steady-state per-frame spam.
+    ++g_frameNum;
+    if (g_frameNum <= 3 || !XR_SUCCEEDED(endResult)) {
+        L("frame %ld: shouldRender=%d locate=%d viewFlags=0x%llx posesValid=%d "
+          "eyes=%d layerCount=%u endFrame=%d",
+          g_frameNum, (int)frameState.shouldRender, (int)locateResult,
+          (unsigned long long)viewFlags, (int)posesValid, eyesRendered,
+          layerCount, (int)endResult);
+    }
 }
 
 void Aleph_OpenXR_Shutdown()
@@ -391,7 +427,8 @@ void Aleph_OpenXR_Shutdown()
     g_sessionState   = XR_SESSION_STATE_UNKNOWN;
     g_active         = false;
 
-    if (g_log) { L("shutdown: done"); std::fclose(g_log); g_log = nullptr; }
+    // Keep the log file open for the life of the process (see Init).
+    L("shutdown: done (cycle %d)", g_cycle);
 }
 
 bool Aleph_OpenXR_IsActive()

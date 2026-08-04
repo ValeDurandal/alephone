@@ -34,6 +34,7 @@
 #include "SoundManager.h"
 #include "fades.h"
 #include "screen.h"
+#include "OpenXR_Session.h"
 #include "Music.h"
 #include "images.h"
 #include "vbl.h"
@@ -583,6 +584,14 @@ void initialize_application(void)
 
 void shutdown_application(void)
 {
+#if defined(__WIN32__) && defined(HAVE_OPENGL)
+	// Clean-exit teardown: destroy the OpenXR session while the GL context
+	// is still alive (SDL_Quit() below tears the window + context down).
+	// The screen-mode teardown only fires on window recreation, not on quit.
+	// No-op if OpenXR never initialized; idempotent with the screen.cpp hook.
+	Aleph_OpenXR_Shutdown();
+#endif
+
 	WadImageCache::instance()->save_cache();
 
 	shutdown_dialogs();
