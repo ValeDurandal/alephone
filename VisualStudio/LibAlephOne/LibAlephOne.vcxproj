@@ -420,6 +420,7 @@
     <ClCompile Include="..\..\Source_Files\CSeries\FilmProfile.cpp" />
     <ClCompile Include="..\..\Source_Files\CSeries\mytm_sdl.cpp" />
     <ClCompile Include="..\..\Source_Files\RenderOther\OpenXR_Smoke.cpp" />
+    <ClCompile Include="..\..\Source_Files\RenderOther\OpenXR_Session.cpp" />
     <ClCompile Include="..\..\Source_Files\Videos\Movie.cpp" />
     <ClCompile Include="..\..\Source_Files\Files\AStream.cpp" />
     <ClCompile Include="..\..\Source_Files\Files\crc.cpp" />

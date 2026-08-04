@@ -37,6 +37,7 @@
 #include <openxr/openxr.h>
 
 #include "OpenXR_Smoke.h"
+#include "OpenXR_Session.h"
 
 #ifdef HAVE_OPENGL
 #include "OGL_Headers.h"
@@ -978,7 +979,11 @@ static void change_screen_mode(int width, int height, int depth, bool nogl, bool
 #if defined (__WIN32__) && (HAVE_OPENGL)
 		glewInit();
 
-		Aleph_OpenXR_SmokeTest();
+		// Step A smoke test proved instance/session/swapchain creation.
+		// Step B takes over: a persistent session that presents each frame.
+		// (Re-enable the smoke test only for one-shot diagnostics.)
+		//Aleph_OpenXR_SmokeTest();
+		Aleph_OpenXR_Init();
 #endif
 
 
@@ -2390,6 +2395,11 @@ bool MainScreenIsOpenGL()
 void MainScreenSwap()
 {
 	SDL_GL_SwapWindow(main_screen);
+
+	// Drive the OpenXR frame loop off the monitor present. No-op unless the
+	// persistent session initialized. Keeps the headset compositor fed even
+	// in menus/loading screens (prevents SteamVR from going idle).
+	Aleph_OpenXR_Frame();
 }
 void MainScreenCenterMouse()
 {

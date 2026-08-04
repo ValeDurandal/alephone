@@ -725,6 +725,7 @@
       <Filter>Sound\Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\..\Source_Files\RenderOther\OpenXR_Smoke.cpp" />
+    <ClCompile Include="..\..\Source_Files\RenderOther\OpenXR_Session.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\Source_Files\CSeries\BStream.h">
