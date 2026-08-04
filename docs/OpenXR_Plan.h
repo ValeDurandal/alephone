@@ -1,5 +1,59 @@
 // OpenXR integration plan for Aleph One VR mod
-// Status: planning / not implemented
+//
+// =====================================================================
+// CURRENT STATE / RESUME HERE   (update at the end of each milestone)
+// ---------------------------------------------------------------------
+// Last updated: 2026-08-04, after Step C0.
+// Branch: vr-mod
+//
+// Verified working (committed):
+//   - Step A: OpenXR swapchains created (2 views @ 2064x2272, sRGB8_alpha8).
+//   - Step B: persistent session + minimal frame loop; solid color in Quest;
+//     clean teardown on video-mode change and on app exit.
+//   - Step C0: the monitor frame is captured and MIRRORED into both eyes
+//     (right-side-up, stereo depth from the dual-FBO prototype, clean quit).
+//     NOTE: this is a mirror, not head-tracked per-eye rendering yet.
+//
+// Key files:
+//   - Source_Files/RenderOther/OpenXR_Session.cpp / .h
+//       Init / CaptureFromDefaultFramebuffer / Frame / Shutdown, all state.
+//   - Source_Files/RenderOther/screen.cpp
+//       * Aleph_OpenXR_Init() after glewInit() (~line 986).
+//       * MainScreenSwap(): capture BEFORE SDL_GL_SwapWindow, Frame() AFTER.
+//       * Aleph_OpenXR_Shutdown() before SDL_DestroyWindow (mode-change).
+//       * dual-FBO monitor stereo block (g_enable_stereo_prototype) — leave
+//         it working; it is untouched by the OpenXR path.
+//   - Source_Files/shell.cpp  shutdown_application(): Shutdown() before SDL_Quit.
+//
+// Build (Windows / VS 2026):
+//   MSBuild VisualStudio/LibAlephOne/LibAlephOne.vcxproj /p:Configuration=Debug
+//     /p:Platform=x64 /t:Build   (LibAlephOne is a static lib — this only
+//   relinks the LIB; the IDE must rebuild the EXE to actually run.)
+//   Gotcha: a killed build can leave orphaned cl.exe / mspdbsrv.exe holding
+//   LibAlephOne.pdb -> error C1041. Fix: kill those processes, rebuild.
+//
+// Runtime log: openxr_session.txt next to the exe (VisualStudio/AlephOne/,
+//   gitignored). Healthy in-game line looks like:
+//     frame N: shouldRender=1 locate=0 viewFlags=0xf posesValid=1 eyes=2
+//              mirrorEyes=2 cap=WxH layerCount=1 endFrame=0
+//
+// HARD CONSTRAINTS (learned the hard way in C0 — see the C0 section below):
+//   1. Per-eye engine rendering must target an ENGINE `FBO` (so it joins the
+//      renderer's FBO active_chain), NOT a raw glBindFramebuffer — otherwise
+//      render_view's pixels land in FB0, not the swapchain.
+//   2. Never call render_view() from MainScreenSwap / the present path: outside
+//      the engine's render pass the texture manager state is invalid during
+//      transitions -> read AV in the texture manager (CTState).
+//   3. Capture->eye blit is a STRAIGHT copy, no Y flip (GL bottom-left origin
+//      matches the GL swapchain image).
+//   4. Keep the monitor dual-FBO stereo path working; every OpenXR entry point
+//      is a no-op when the session is inactive.
+//
+// NEXT: Step C1 — drive ONE eye's view_data from the real xrLocateViews
+//   pose/FOV (head-tracked camera), rendered via an engine FBO into that eye's
+//   swapchain image. Then C2: both eyes from runtime views; retire the invented
+//   dual-FBO offsets when XR is active. (Details at the bottom of this file.)
+// =====================================================================
 //
 // Prerequisite already done:
 //   - Dual-FBO side-by-side stereo path (g_enable_stereo_prototype)
