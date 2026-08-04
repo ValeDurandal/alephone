@@ -2402,12 +2402,23 @@ bool MainScreenIsOpenGL()
 }
 void MainScreenSwap()
 {
+#if defined (__WIN32__) && (HAVE_OPENGL)
+	// C0: capture the just-rendered monitor frame (still in the back buffer)
+	// so the OpenXR frame can mirror it into the headset. Must run BEFORE the
+	// swap. No-op unless the persistent OpenXR session is active.
+	if (Aleph_OpenXR_IsActive())
+		Aleph_OpenXR_CaptureFromDefaultFramebuffer(MainScreenPixelWidth(),
+		                                            MainScreenPixelHeight());
+#endif
+
 	SDL_GL_SwapWindow(main_screen);
 
-	// Drive the OpenXR frame loop off the monitor present. No-op unless the
-	// persistent session initialized. Keeps the headset compositor fed even
-	// in menus/loading screens (prevents SteamVR from going idle).
+#if defined (__WIN32__) && (HAVE_OPENGL)
+	// Drive the OpenXR frame loop off the monitor present; it blits the frame
+	// captured above into each eye. Keeps the headset compositor fed even in
+	// menus/loading (prevents SteamVR going idle).
 	Aleph_OpenXR_Frame();
+#endif
 }
 void MainScreenCenterMouse()
 {

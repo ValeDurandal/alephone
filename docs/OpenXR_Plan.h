@@ -185,3 +185,60 @@
 //        instead of a flat clear.
 //     4. Drive `view_data` from `xrLocateViews` pose/FOV, replacing the
 //        invented eye offsets from the dual-FBO prototype.
+//
+//
+// ## Progress summary (as of 2026-08-04) — Step C0 COMPLETE
+//
+// Goal of C0: get real, recognizable game pixels into the headset (any camera)
+// to prove the pixel path end-to-end, before wiring head pose -> view_data.
+//
+// ### What shipped
+//  - The teal clear is replaced by a **capture-and-mirror** of the monitor
+//    frame into both eyes. Confirmed on Quest: right-side-up game imagery in
+//    the headset (menu + in-game + HUD), with stereo depth, clean quit.
+//  - `screen.cpp` `MainScreenSwap()`:
+//      * BEFORE `SDL_GL_SwapWindow` — `Aleph_OpenXR_CaptureFromDefaultFramebuffer`
+//        copies the finished back buffer (FB0) into a capture texture.
+//      * AFTER the swap — `Aleph_OpenXR_Frame()` blits that capture into each
+//        eye's swapchain image (scaled to the eye; teal remains the fallback).
+//      * Both the capture and Frame calls are `#if __WIN32__ && HAVE_OPENGL`
+//        guarded (also fixed the previously-unguarded Frame call).
+//  - `OpenXR_Session.cpp`: added capture texture/FBO + `RenderEyeImage` blit;
+//    frame log now reports `mirrorEyes` and capture size.
+//
+// ### Why NOT a second render_view (important for C1/C2)
+//  First attempt called `render_view()` from the eye callback into a raw FBO.
+//  Two hard blocks, both diagnosed:
+//   1. **Target integration:** the world renderer composites through the
+//      engine's `FBO`/`FBOSwapper` `active_chain` stack and restores to FB0 on
+//      deactivate. A raw `glBindFramebuffer` is not on that stack, so
+//      render_view's pixels landed in FB0 (already swapped, invisible) and the
+//      eye kept its teal clear ("teal in game"). The dual-FBO monitor path
+//      works only because it uses the engine `FBO` class (on the chain).
+//   2. **Lifetime/timing:** calling render_view from `MainScreenSwap` (outside
+//      the normal render pipeline) touched texture/collection state that is
+//      invalid during the level-exit transition -> read AV in the texture
+//      manager (`CTState`). render_view must run inside the engine's own
+//      render pass, when textures are valid.
+//  => For C1/C2, per-eye rendering must go into an engine `FBO` (so it joins
+//     the active_chain) during a valid render pass, then be submitted to the
+//     swapchain — not a second render_view bolted onto the present.
+//
+// ### Orientation note
+//  OpenGL swapchain images share GL's bottom-left origin, so the capture->eye
+//  blit is a STRAIGHT copy (no Y flip). An added flip made everything
+//  upside-down; removing it fixed menu + both eyes + HUD uniformly.
+//
+// ### Known / expected (out of scope for C0)
+//  - Headset mirrors the monitor, so with `g_enable_stereo_prototype = true`
+//    each eye shows the full side-by-side composite; the stereo depth seen is
+//    the prototype's fixed separation, NOT head-tracked per-eye views.
+//  - Aspect is stretched to the ~square eye; colors/gamma approximate.
+//  - No head tracking yet (camera == monitor camera). In-VR cursor is absent,
+//    so quitting is easiest from the monitor.
+//
+// ### Next: C1
+//  - Drive ONE eye's `view_data` from the real `xrLocateViews` pose/FOV
+//    (head-tracked camera), rendered via an engine FBO into that eye's
+//    swapchain image. Then C2: both eyes from runtime views; retire the
+//    invented dual-FBO offsets when XR is active.

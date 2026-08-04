@@ -61,7 +61,10 @@ XrSessionState g_sessionState   = XR_SESSION_STATE_UNKNOWN;
 bool           g_sessionRunning = false;   // between xrBeginSession/xrEndSession
 bool           g_active         = false;   // Init() fully succeeded
 
-GLuint g_fbo = 0;
+GLuint g_fbo       = 0;   // scratch FBO: swapchain image bound as color, we blit into it
+GLuint g_captureFbo = 0;  // holds a copy of the last monitor frame
+GLuint g_captureTex = 0;
+int    g_capW = 0, g_capH = 0;
 
 FILE*  g_log       = nullptr;
 int    g_cycle     = 0;    // Init count this process (detects re-init churn)
@@ -239,24 +242,86 @@ void PollEvents()
     }
 }
 
-// Clear one acquired swapchain image to a solid color via the scratch FBO.
-void ClearImage(GLuint texture, int32_t w, int32_t h)
+// Fill one acquired swapchain image: clear to teal (fallback), then blit the
+// captured monitor frame over it (scaled to the eye size). Returns true if the
+// captured frame was blitted. Pure framebuffer ops — no engine render_view, so
+// this is safe at any point in the game's lifetime.
+bool RenderEyeImage(int eye, GLuint texture, int32_t w, int32_t h)
 {
-    GLint prevFbo = 0;
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    GLint prevRead = 0, prevDraw = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDraw);
 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_fbo);
     glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
         GL_TEXTURE_2D, texture, 0);
 
+    if (g_frameNum < 1) {   // one-time completeness check
+        GLenum status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE)
+            L("WARN: eye FBO incomplete: 0x%x", (unsigned)status);
+    }
+
     glViewport(0, 0, w, h);
-    glClearColor(0.10f, 0.55f, 0.60f, 1.0f);   // distinct teal so it's obviously ours
+    glClearColor(0.10f, 0.55f, 0.60f, 1.0f);   // teal fallback base
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Detach and restore the framebuffer binding the game expects.
+    bool blitted = false;
+    if (g_captureFbo && g_capW > 0 && g_capH > 0) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_captureFbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_fbo);
+        glDisable(GL_FRAMEBUFFER_SRGB);
+        // Straight copy (no Y flip): the OpenGL swapchain image shares GL's
+        // bottom-left origin with our capture, so the orientation already
+        // matches what the compositor expects.
+        glBlitFramebuffer(0, 0, g_capW, g_capH, 0, 0, w, h,
+            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        blitted = true;
+    }
+
+    // Detach and restore the framebuffer bindings the game expects.
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_fbo);
     glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
         GL_TEXTURE_2D, 0, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prevFbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevRead);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prevDraw);
+    return blitted;
+}
+
+// Copy the current default framebuffer (the just-rendered monitor frame) into
+// our capture texture. Called before SDL_GL_SwapWindow, while the back buffer
+// still holds the frame.
+void CaptureDefaultFramebuffer(int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+
+    if (!g_captureFbo) glGenFramebuffers(1, &g_captureFbo);
+    if (!g_captureTex || w != g_capW || h != g_capH) {
+        if (g_captureTex) glDeleteTextures(1, &g_captureTex);
+        glGenTextures(1, &g_captureTex);
+        glBindTexture(GL_TEXTURE_2D, g_captureTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
+            GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_captureFbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, g_captureTex, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        g_capW = w; g_capH = h;
+    }
+
+    GLint prevRead = 0, prevDraw = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDraw);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);            // the just-drawn frame
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_captureFbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevRead);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prevDraw);
 }
 
 } // namespace
@@ -264,6 +329,12 @@ void ClearImage(GLuint texture, int32_t w, int32_t h)
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+void Aleph_OpenXR_CaptureFromDefaultFramebuffer(int w, int h)
+{
+    if (!g_active) return;
+    CaptureDefaultFramebuffer(w, h);
+}
 
 bool Aleph_OpenXR_Init()
 {
@@ -316,7 +387,8 @@ void Aleph_OpenXR_Frame()
     XrResult locateResult = XR_SUCCESS;
     XrViewStateFlags viewFlags = 0;
     bool  posesValid   = false;
-    int   eyesRendered = 0;
+    int   eyesRendered = 0;   // eyes whose image we acquired + cleared
+    int   mirrorEyes   = 0;   // eyes that got the captured monitor frame
 
     if (frameState.shouldRender) {
         // Locate the eye views for this frame's predicted display time.
@@ -355,7 +427,9 @@ void Aleph_OpenXR_Frame()
                 wait.timeout = XR_INFINITE_DURATION;
                 xrWaitSwapchainImage(sc.handle, &wait);
 
-                ClearImage(sc.images[imgIndex].image, sc.width, sc.height);
+                if (RenderEyeImage((int)i, sc.images[imgIndex].image,
+                                   sc.width, sc.height))
+                    ++mirrorEyes;
 
                 XrSwapchainImageReleaseInfo rel{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
                 xrReleaseSwapchainImage(sc.handle, &rel);
@@ -400,16 +474,19 @@ void Aleph_OpenXR_Frame()
     ++g_frameNum;
     if (g_frameNum <= 3 || !XR_SUCCEEDED(endResult)) {
         L("frame %ld: shouldRender=%d locate=%d viewFlags=0x%llx posesValid=%d "
-          "eyes=%d layerCount=%u endFrame=%d",
+          "eyes=%d mirrorEyes=%d cap=%dx%d layerCount=%u endFrame=%d",
           g_frameNum, (int)frameState.shouldRender, (int)locateResult,
           (unsigned long long)viewFlags, (int)posesValid, eyesRendered,
-          layerCount, (int)endResult);
+          mirrorEyes, g_capW, g_capH, layerCount, (int)endResult);
     }
 }
 
 void Aleph_OpenXR_Shutdown()
 {
-    if (g_fbo) { glDeleteFramebuffers(1, &g_fbo); g_fbo = 0; }
+    if (g_fbo)        { glDeleteFramebuffers(1, &g_fbo);        g_fbo = 0; }
+    if (g_captureFbo) { glDeleteFramebuffers(1, &g_captureFbo); g_captureFbo = 0; }
+    if (g_captureTex) { glDeleteTextures(1, &g_captureTex);     g_captureTex = 0; }
+    g_capW = g_capH = 0;
 
     if (g_sessionRunning) { xrEndSession(g_session); g_sessionRunning = false; }
 
