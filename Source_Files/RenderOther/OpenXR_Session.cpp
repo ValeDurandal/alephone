@@ -72,6 +72,9 @@ bool   g_lastViewValid[2] = { false, false };
 GLuint g_eyeSrcFbo[2]     = { 0, 0 };
 int    g_eyeSrcW[2]       = { 0, 0 };
 int    g_eyeSrcH[2]       = { 0, 0 };
+XrFovf g_eyeFov[2]        = {};       // submitted fov override (matches render)
+bool   g_eyeFovSet[2]     = { false, false };
+int    g_mirrorRect[4]    = { 0, 0, 0, 0 };   // x,y,w,h crop for the monitor mirror
 
 FILE*  g_log        = nullptr;
 int    g_cycle      = 0;   // Init count this process (detects re-init churn)
@@ -278,11 +281,12 @@ bool RenderEyeImage(int eye, GLuint texture, int32_t w, int32_t h)
     // Prefer a host-rendered eye image (C1: real head-driven engine render for
     // this eye); otherwise fall back to mirroring the monitor frame (C0).
     bool blitted = false;
+    bool isMirror = false;
     GLuint srcFbo = 0; int srcW = 0, srcH = 0;
     if (eye >= 0 && eye < 2 && g_eyeSrcFbo[eye]) {
         srcFbo = g_eyeSrcFbo[eye]; srcW = g_eyeSrcW[eye]; srcH = g_eyeSrcH[eye];
     } else if (g_captureFbo && g_capW > 0 && g_capH > 0) {
-        srcFbo = g_captureFbo; srcW = g_capW; srcH = g_capH;
+        srcFbo = g_captureFbo; srcW = g_capW; srcH = g_capH; isMirror = true;
     }
     if (g_logThisFrame)
         L("  blit eye=%d srcFbo=%u src=%dx%d dst=%dx%d", eye,
@@ -293,10 +297,26 @@ bool RenderEyeImage(int eye, GLuint texture, int32_t w, int32_t h)
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_fbo);
         glDisable(GL_FRAMEBUFFER_SRGB);
         // Straight copy (no Y flip): the OpenGL swapchain image shares GL's
-        // bottom-left origin with our source, so the orientation already
-        // matches what the compositor expects.
-        glBlitFramebuffer(0, 0, srcW, srcH, 0, 0, w, h,
-            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        // bottom-left origin with our source, so the orientation already matches.
+        if (isMirror && g_mirrorRect[2] > 0 && g_mirrorRect[3] > 0) {
+            // Mirror only a sub-region (e.g. the terminal), fit + centered in the
+            // eye preserving its aspect (letterboxed onto the teal-cleared eye).
+            const int sx = g_mirrorRect[0], sy = g_mirrorRect[1];
+            const int sw = g_mirrorRect[2], sh = g_mirrorRect[3];
+            const double sa = (double)sw / (double)sh;
+            const double da = (double)w  / (double)h;
+            int dw, dh;
+            if (sa > da) { dw = w;                    dh = (int)((double)w / sa); }
+            else         { dh = h;                    dw = (int)((double)h * sa); }
+            const double PANEL = 0.65;  // shrink to a comfortable central panel
+            dw = (int)(dw * PANEL); dh = (int)(dh * PANEL);
+            const int dx = (w - dw) / 2, dy = (h - dh) / 2;
+            glBlitFramebuffer(sx, sy, sx + sw, sy + sh, dx, dy, dx + dw, dy + dh,
+                GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        } else {
+            glBlitFramebuffer(0, 0, srcW, srcH, 0, 0, w, h,
+                GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        }
         blitted = true;
     }
 
@@ -483,7 +503,7 @@ void Aleph_OpenXR_Frame()
                 XrCompositionLayerProjectionView& pv = projViews[i];
                 pv = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
                 pv.pose = pose;
-                pv.fov  = views[i].fov;
+                pv.fov  = (i < 2 && g_eyeFovSet[i]) ? g_eyeFov[i] : views[i].fov;
                 pv.subImage.swapchain               = sc.handle;
                 pv.subImage.imageArrayIndex         = 0;
                 pv.subImage.imageRect.offset        = { 0, 0 };
@@ -512,6 +532,8 @@ void Aleph_OpenXR_Frame()
     // render pass, so clearing here makes us fall back to the mirror whenever
     // that pass didn't run (e.g. menus).
     g_eyeSrcFbo[0] = g_eyeSrcFbo[1] = 0;
+    g_eyeFovSet[0] = g_eyeFovSet[1] = false;
+    g_mirrorRect[2] = g_mirrorRect[3] = 0;
 
     // Quiet diagnostics: log the first few frames of each cycle (enough to
     // confirm the loop is submitting real layers), plus any frame where
@@ -592,7 +614,24 @@ void Aleph_OpenXR_SetEyeSourceFbo(int eye, unsigned int glFbo, int w, int h)
     g_eyeSrcH[eye]   = h;
 }
 
+void Aleph_OpenXR_SetEyeFov(int eye, float angleLeft, float angleRight,
+                            float angleUp, float angleDown)
+{
+    if (eye < 0 || eye >= 2) return;
+    g_eyeFov[eye].angleLeft  = angleLeft;
+    g_eyeFov[eye].angleRight = angleRight;
+    g_eyeFov[eye].angleUp    = angleUp;
+    g_eyeFov[eye].angleDown  = angleDown;
+    g_eyeFovSet[eye] = true;
+}
+
 void Aleph_OpenXR_LogLine(const char* msg)
 {
     if (msg) L("%s", msg);
+}
+
+void Aleph_OpenXR_SetMirrorSrcRect(int x, int y, int w, int h)
+{
+    g_mirrorRect[0] = x; g_mirrorRect[1] = y;
+    g_mirrorRect[2] = w; g_mirrorRect[3] = h;
 }

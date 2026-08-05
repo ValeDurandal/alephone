@@ -1299,6 +1299,270 @@ void update_world_view_camera()
 
 extern bool is_network_pregame;
 
+#if defined (__WIN32__) && defined(HAVE_OPENGL)
+// C2 Slice A: render BOTH eyes head-tracked into engine FBOs and hand each to
+// the OpenXR frame. Runs inside render_screen (valid render pass; the engine
+// FBO joins the renderer's active_chain), same safe pattern as C1's left eye.
+//
+// Orientation: both eyes share the head yaw/pitch (Marathon is 2.5D - real yaw,
+// sheared pitch, no roll). Stereo depth comes from a per-eye HORIZONTAL position
+// offset derived from the two runtime eye poses (meters -> world units via a
+// seeded, tunable scale). Symmetric FOV for Slice A; asymmetric XrFovf is B.
+static void Aleph_OpenXR_RenderEyes()
+{
+	if (!(Aleph_OpenXR_IsActive() && get_game_state() == _game_in_progress &&
+	      world_view && world_view->origin_polygon_index >= 0))
+	{
+		Aleph_OpenXR_SetEyeSourceFbo(0, 0, 0, 0);
+		Aleph_OpenXR_SetEyeSourceFbo(1, 0, 0, 0);
+		return;
+	}
+
+	// Terminal / overhead-map: those render a 2D screen (render_computer_interface
+	// / render_overhead_map), not the world, so a world render_view() eye pass
+	// would show the wrong thing. Mirror the monitor (the terminal/map) as a fused
+	// mono PANEL: clear the per-eye world source so Frame() blits the captured
+	// frame, and give BOTH eyes the SAME symmetric fov -> the single mirrored
+	// image lines up in both eyes instead of showing double (each eye's real fov
+	// is asymmetric/nasal, mirror-opposite, which splits a mono image).
+	if (world_view->terminal_mode_active || world_view->overhead_map_active)
+	{
+		float q[4], p[3], fv[4];
+		if (Aleph_OpenXR_GetEyePose(0, q, p, fv))
+		{
+			const float hh = 0.5f * (fv[1] - fv[0]);
+			const float vv = 0.5f * (fv[2] - fv[3]);
+			Aleph_OpenXR_SetEyeFov(0, -hh, hh, vv, -vv);
+			Aleph_OpenXR_SetEyeFov(1, -hh, hh, vv, -vv);
+		}
+		Aleph_OpenXR_SetEyeSourceFbo(0, 0, 0, 0);
+		Aleph_OpenXR_SetEyeSourceFbo(1, 0, 0, 0);
+		return;
+	}
+
+	float q0[4], p0[3], f0[4], q1[4], p1[3], f1[4];
+	const bool have0 = Aleph_OpenXR_GetEyePose(0, q0, p0, f0);
+	const bool have1 = Aleph_OpenXR_GetEyePose(1, q1, p1, f1);
+	if (!have0)
+	{
+		Aleph_OpenXR_SetEyeSourceFbo(0, 0, 0, 0);
+		Aleph_OpenXR_SetEyeSourceFbo(1, 0, 0, 0);
+		return;
+	}
+
+	// --- Tunables (adjust by feel in-headset) ---
+	const int    YAW_SIGN        = +1;
+	const int    PITCH_SIGN      = +1;
+	const int    SEP_SIGN        = +1;      // flip if the eyes are swapped
+	// Stereo separation scale, tuned by feel in-headset:
+	//   too large  -> near objects won't fuse (eye strain), world feels tiny;
+	//   too small  -> gigantism (world feels huge / zoomed), depth flat.
+	//   2048 was too large, 512 too small; 1024 (WORLD_ONE ~= 1 m) is the middle.
+	const double XR_WU_PER_METER = 1024.0;
+	const double PI = 3.14159265358979323846;
+
+	// --- head orientation from eye 0 (both eyes share it) ---
+	const float qx = q0[0], qy = q0[1], qz = q0[2], qw = q0[3];
+	const float fwx = -2.0f * (qx * qz + qw * qy);
+	float       fwy = -2.0f * (qy * qz - qw * qx);
+	const float fwz = -(1.0f - 2.0f * (qx * qx + qy * qy));
+	if (fwy >  1.0f) fwy =  1.0f;
+	if (fwy < -1.0f) fwy = -1.0f;
+	const double to_units = (double)NUMBER_OF_ANGLES / (2.0 * PI);
+	angle head_yaw   = (angle)(lround(atan2((double)fwx, (double)(-fwz)) * to_units) * YAW_SIGN);
+	angle head_pitch = (angle)(lround(asin((double)fwy) * to_units) * PITCH_SIGN);
+
+	// No host-side smoothing/rejection: the OpenXR runtime already predicts and
+	// smooths the head pose. Filtering on top of it fought the (slightly uneven,
+	// over Air Link) pose updates and caused constant stutter/jerking. Trust the
+	// raw pose - this is how VR head tracking is normally driven.
+	const angle new_yaw = NORMALIZE_ANGLE(world_view->yaw + head_yaw);
+
+	// VIEW FOLLOWS AIM (while XR is active): the gun fires along the player's aim
+	// (mouse elevation), so we base the view pitch on that -> the crosshair/gun
+	// sits at view center and looking == shooting. A small CAPPED head-pitch
+	// "assist" keeps a touch of VR head response without letting the view drift
+	// far from where the gun points. Set the cap to 0 to lock fully to aim.
+	const int HEAD_PITCH_ASSIST_CAP = 10;   // ~7 deg
+	int assist = head_pitch;                // head_pitch is signed [-128,128]
+	if (assist >  HEAD_PITCH_ASSIST_CAP) assist =  HEAD_PITCH_ASSIST_CAP;
+	if (assist < -HEAD_PITCH_ASSIST_CAP) assist = -HEAD_PITCH_ASSIST_CAP;
+
+	// CRITICAL: world_view->pitch (the player's aim) is stored NORMALIZED to
+	// [0,512): looking DOWN 43 deg is 469, not -43. Convert to SIGNED before
+	// clamping, or the clamp reads "down" as a huge up-angle and slams the view
+	// to +PITCH_LIMIT (straight up) the moment you aim down -> the pitch-down
+	// glitch. Clamp in signed space to +/- the vertical half-FOV (past that the
+	// horizon leaves the image and the renderer breaks), then re-normalize.
+	int aim_signed = (int)world_view->pitch;
+	if (aim_signed >= NUMBER_OF_ANGLES / 2) aim_signed -= NUMBER_OF_ANGLES;
+	int np_signed = aim_signed + assist;
+
+	double vhalf = 0.5 * ((double)f0[2] - (double)f0[3]);   // vertical half-FOV (rad)
+	if (vhalf < 0.35) vhalf = 0.35;
+	angle PITCH_LIMIT = (angle)lround(0.9 * vhalf * to_units);
+	if (PITCH_LIMIT > (NUMBER_OF_ANGLES / 4) - 8) PITCH_LIMIT = (NUMBER_OF_ANGLES / 4) - 8;
+	if (np_signed >  (int)PITCH_LIMIT) np_signed =  (int)PITCH_LIMIT;
+	if (np_signed < -(int)PITCH_LIMIT) np_signed = -(int)PITCH_LIMIT;
+	angle new_pitch = (angle)NORMALIZE_ANGLE(np_signed);
+
+	// --- per-eye horizontal separation ---
+	// IPD is physically ~constant; deriving it from the per-frame eye positions
+	// injects spikes that lurch the eye sideways into geometry ("texture in your
+	// face"). Use a FIXED nominal IPD so the separation is rock-steady.
+	const double FIXED_IPD_M = 0.063;
+	const double half_sep_wu = 0.5 * FIXED_IPD_M * XR_WU_PER_METER;
+	(void)p0; (void)p1;   // eye positions no longer used for separation
+	// game right vector for the head-tracked yaw (dual-FBO convention)
+	const double rvx =  (double)sine_table[new_yaw]   / (double)TRIG_MAGNITUDE;
+	const double rvy = -(double)cosine_table[new_yaw] / (double)TRIG_MAGNITUDE;
+
+	// Render size: match the eye's aspect (no stretch into the ~square eye) at a
+	// moderate resolution near the proven ~816-tall size (NOT the 2064x2272 that
+	// crashed on load); the session blit-scales up to the swapchain.
+	GLint vp[4] = { 0, 0, 0, 0 };
+	glGetIntegerv(GL_VIEWPORT, vp);
+	int sw = 0, sh = 0;
+	Aleph_OpenXR_GetEyeImageSize(0, &sw, &sh);
+	if (sw <= 0 || sh <= 0) { sw = 2064; sh = 2272; }
+	const int eh = vp[3] > 0 ? vp[3] : 816;
+	int ew = (int)lround((double)eh * (double)sw / (double)sh);
+	if (ew < 64) ew = 64;
+
+	// save monitor view state
+	const world_point3d s_origin = world_view->origin;
+	const short s_origin_poly = world_view->origin_polygon_index;
+	const angle s_yaw = world_view->yaw, s_pit = world_view->pitch;
+	const fixed_angle s_vyaw = world_view->virtual_yaw, s_vpit = world_view->virtual_pitch;
+	const short s_sw = world_view->screen_width, s_sh = world_view->screen_height;
+	const short s_std = world_view->standard_screen_width;
+	const float s_fov = world_view->field_of_view;
+	const bool  s_wep = world_view->show_weapons_in_hand;
+
+	double dbg_hfov_deg = 0.0, dbg_vfov_deg = 0.0;   // actual submitted fov (eye 0)
+	const double sep = half_sep_wu;   // full stereo separation
+	static FBO* eye_fbo[2] = { nullptr, nullptr };
+
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		if (!eye_fbo[eye] || (int)eye_fbo[eye]->_w != ew || (int)eye_fbo[eye]->_h != eh)
+		{
+			delete eye_fbo[eye];
+			eye_fbo[eye] = new FBO(ew, eh);
+		}
+
+		const double sgn = (eye == 0 ? -1.0 : +1.0) * SEP_SIGN;
+		world_view->origin = s_origin;
+		world_view->origin.x += (world_distance)lround(sgn * sep * rvx);
+		world_view->origin.y += (world_distance)lround(sgn * sep * rvy);
+
+		// Keep origin_polygon_index consistent with the offset eye position. The
+		// BSP renderer builds visibility from origin_polygon_index; if the lateral
+		// stereo offset crosses into an adjacent polygon (common near walls,
+		// stairs, T-junctions) while the index still names the player's polygon,
+		// the render goes haywire (you see up through the ceiling / into the void).
+		{
+			bool offset_ok = false;
+			world_point2d par = { s_origin.x, s_origin.y };
+			const short np = find_new_object_polygon(&par,
+				(world_point2d*)&world_view->origin, s_origin_poly);
+			if (np != NONE)
+			{
+				// Also require the camera height to be inside this polygon's
+				// floor/ceiling span (with margin). Near stairs / low ceilings /
+				// ceiling-window rooms the offset can land in a polygon whose
+				// floor is above (or ceiling below) the camera -> render breaks.
+				struct polygon_data* poly = get_polygon_data(np);
+				if (poly &&
+					world_view->origin.z > poly->floor_height + WORLD_ONE / 32 &&
+					world_view->origin.z < poly->ceiling_height - WORLD_ONE / 32)
+				{
+					world_view->origin_polygon_index = np;
+					offset_ok = true;
+				}
+			}
+			if (!offset_ok)
+			{
+				// Offset crossed a solid wall or a height boundary: don't render
+				// from a bad polygon. Drop the offset for this eye (stereo is
+				// lost locally, but no glitch).
+				world_view->origin = s_origin;
+				world_view->origin_polygon_index = s_origin_poly;
+			}
+		}
+
+		world_view->yaw = new_yaw;
+		world_view->pitch = new_pitch;
+		world_view->virtual_yaw = (fixed_angle)new_yaw * FIXED_ONE;
+		world_view->virtual_pitch = (fixed_angle)new_pitch * FIXED_ONE;
+		world_view->screen_width = ew;
+		world_view->screen_height = eh;
+		world_view->standard_screen_width = ew;
+
+		const float* f = (eye == 0 ? f0 : (have1 ? f1 : f0));
+		// Base symmetric FOV so initialize_view_data sets sane fields; the
+		// asymmetric projection below overrides the ones that matter.
+		const double hfov = ((double)f[1] - (double)f[0]) * 180.0 / PI;
+		if (hfov > 30.0 && hfov < 160.0) world_view->field_of_view = (float)hfov;
+
+		world_view->show_weapons_in_hand = false;
+		initialize_view_data(world_view);
+
+		// Force the projection to the REAL runtime per-eye FOV. The engine
+		// inflates field_of_view by 1.3x internally (rendered ~122 deg vs the
+		// headset's ~94 deg -> wrong scale/feel), so we bypass field_of_view and
+		// set world_to_screen_* directly from the runtime half-angles. Symmetric
+		// (centered) approximation of the asymmetric XrFovf; render == submit so
+		// the eyes fuse and objects are the correct angular size.
+		// update_view_data() copies real_world_to_screen_* -> world_to_screen_*.
+		{
+			double hh = 0.5 * ((double)f[1] - (double)f[0]);   // half H span (rad)
+			double vv = 0.5 * ((double)f[2] - (double)f[3]);   // half V span (rad)
+			if (hh < 0.15) hh = 0.15; else if (hh > 1.30) hh = 1.30;
+			if (vv < 0.15) vv = 0.15; else if (vv > 1.30) vv = 1.30;
+			world_view->half_screen_width  = (short)(ew / 2);
+			world_view->half_screen_height = (short)(eh / 2);
+			world_view->real_world_to_screen_x = world_view->world_to_screen_x =
+				(short)lround((double)ew * 0.5 / tan(hh));
+			world_view->real_world_to_screen_y = world_view->world_to_screen_y =
+				(short)lround((double)eh * 0.5 / tan(vv));
+			world_view->half_cone          = (angle)(lround(hh * to_units) + 6);
+			world_view->half_vertical_cone = (angle)(lround(vv * to_units) + 6);
+			Aleph_OpenXR_SetEyeFov(eye, (float)(-hh), (float)hh, (float)vv, (float)(-vv));
+			if (eye == 0) { dbg_hfov_deg = hh * 2.0 * 180.0 / PI; dbg_vfov_deg = vv * 2.0 * 180.0 / PI; }
+			(void)f;
+		}
+
+		eye_fbo[eye]->activate(true);
+		render_view(world_view, software_render_dest.get());
+		eye_fbo[eye]->deactivate();
+		Aleph_OpenXR_SetEyeSourceFbo(eye, eye_fbo[eye]->fbo(), ew, eh);
+	}
+
+	// restore monitor view state
+	world_view->origin = s_origin;
+	world_view->origin_polygon_index = s_origin_poly;
+	world_view->yaw = s_yaw; world_view->pitch = s_pit;
+	world_view->virtual_yaw = s_vyaw; world_view->virtual_pitch = s_vpit;
+	world_view->screen_width = s_sw; world_view->screen_height = s_sh;
+	world_view->standard_screen_width = s_std;
+	world_view->field_of_view = s_fov; world_view->show_weapons_in_hand = s_wep;
+	initialize_view_data(world_view);
+
+	static int dbg = 0;
+	if (dbg < 3)
+	{
+		++dbg;
+		char b[192];
+		snprintf(b, sizeof(b),
+			"C2A eyes: yaw=%d pitch=%d ipd_wu=%.1f hfov=%.1f vfov=%.1f ew=%d eh=%d have1=%d",
+			(int)new_yaw, (int)new_pitch, half_sep_wu * 2.0,
+			dbg_hfov_deg, dbg_vfov_deg, ew, eh, (int)have1);
+		Aleph_OpenXR_LogLine(b);
+	}
+}
+#endif
+
 void render_screen(short ticks_elapsed)
 {
 	// Make whatever changes are necessary to the world_view structure based on whichever player is frontmost
@@ -1484,7 +1748,11 @@ void render_screen(short ticks_elapsed)
 
 		static bool g_enable_stereo_prototype = true;
 
-		if (!g_enable_stereo_prototype)
+		// When OpenXR is active the headset gets true per-eye renders from
+		// Aleph_OpenXR_RenderEyes(); render the MONITOR as a single mono pass so
+		// we do 1 monitor + 2 eye renders instead of 2 + 2 (and so the mirror
+		// fallback is a plain mono view, not the invented side-by-side stereo).
+		if (!g_enable_stereo_prototype || Aleph_OpenXR_IsActive())
 		{
 			render_view(world_view, software_render_dest.get());
 		}
@@ -1581,172 +1849,31 @@ void render_screen(short ticks_elapsed)
 		render_view(world_view, software_render_dest.get());
 	}
 
-#if defined (__WIN32__)
-	// --- C1: render the LEFT eye with a head-tracked camera into an engine
-	// FBO, then hand it to the OpenXR frame to blit into the left swapchain.
-	// This runs INSIDE render_screen (textures valid, engine FBO joins the
-	// renderer's active_chain) to avoid the C0 mid-present crash. Rotation-only
-	// for now; the pose lags head motion by ~one frame. No-op unless the
-	// OpenXR session is active and we are in a live game.
-	if (Aleph_OpenXR_IsActive() && get_game_state() == _game_in_progress &&
-	    world_view && world_view->origin_polygon_index >= 0)
+#if defined (__WIN32__) && defined(HAVE_OPENGL)
+	// C2: render BOTH eyes head-tracked into engine FBOs and hand each to the
+	// OpenXR frame (see Aleph_OpenXR_RenderEyes above). Self-guards: no-op
+	// unless the session is active and we are in a live game.
+	// In terminal/map mode we mirror the monitor instead; tell the session to
+	// mirror only the terminal/map region (fit + centered) rather than the whole
+	// stretched frame, so it's readable. Map window rect -> captured-FB GL coords.
+	if (Aleph_OpenXR_IsActive())
 	{
-		float xrq[4], xrp[3], xrfov[4];   // quat xyzw, pos xyz, fov L/R/U/D (rad)
-		if (Aleph_OpenXR_GetEyePose(0, xrq, xrp, xrfov))
+		if (world_view->terminal_mode_active || world_view->overhead_map_active)
 		{
-			// Render at the CURRENT monitor viewport size (the scale the engine
-			// just rendered at), then blit-scale into the eye. Avoids resizing
-			// the shader renderer's internal FBOs to the huge swapchain size;
-			// matches the dual-FBO prototype's proven pattern.
-			GLint xrvp[4] = { 0, 0, 0, 0 };
-			glGetIntegerv(GL_VIEWPORT, xrvp);
-			const int ew = xrvp[2] > 0 ? xrvp[2] : 640;
-			const int eh = xrvp[3] > 0 ? xrvp[3] : 480;
-
-			static int xr_calls = 0;
-			const bool step_log = (xr_calls < 5);
-			++xr_calls;
-			if (step_log) { char b[96]; snprintf(b, sizeof(b),
-				"C1 step: enter ew=%d eh=%d poly=%d", ew, eh,
-				(int)world_view->origin_polygon_index); Aleph_OpenXR_LogLine(b); }
-
-			{
-				static FBO* xr_eye_fbo = nullptr;
-				if (!xr_eye_fbo || (int)xr_eye_fbo->_w != ew || (int)xr_eye_fbo->_h != eh)
-				{
-					delete xr_eye_fbo;
-					xr_eye_fbo = new FBO(ew, eh);
-				}
-				if (step_log) Aleph_OpenXR_LogLine("C1 step: fbo ready");
-
-				// Tunables — flip a sign if head motion goes the wrong way.
-				const int  YAW_SIGN   = +1;
-				const int  PITCH_SIGN = +1;
-				const bool USE_XR_FOV = true;
-				const double PI = 3.14159265358979323846;
-
-				// pose orientation (LOCAL space, +Y up, -Z fwd) -> forward vec
-				const float qx = xrq[0], qy = xrq[1];
-				const float qz = xrq[2], qw = xrq[3];
-				const float fwx = -2.0f * (qx * qz + qw * qy);
-				float       fwy = -2.0f * (qy * qz - qw * qx);
-				const float fwz = -(1.0f - 2.0f * (qx * qx + qy * qy));
-				if (fwy >  1.0f) fwy =  1.0f;
-				if (fwy < -1.0f) fwy = -1.0f;
-				const double yaw_rad   = atan2((double)fwx, (double)(-fwz));
-				const double pitch_rad = asin((double)fwy);
-				const double to_units  = (double)NUMBER_OF_ANGLES / (2.0 * PI);
-				angle head_yaw   = (angle)(lround(yaw_rad   * to_units) * YAW_SIGN);
-				angle head_pitch = (angle)(lround(pitch_rad * to_units) * PITCH_SIGN);
-
-				// Spike smoothing: rate-limit the head angles frame to frame.
-				// Real head motion is at most ~10 angle-units/frame, so a cap well
-				// above that passes normal motion through untouched, but bounds a
-				// sudden tracking spike (a valid-but-wrong pose that would snap the
-				// view, e.g. straight up) to a small step that recovers next frame.
-				{
-					static angle s_prev_yaw = 0, s_prev_pit = 0;
-					static bool  s_have_prev = false;
-					const int MAX_STEP = 32;   // ~22 deg/frame; far above real motion
-					if (s_have_prev)
-					{
-						int dp = (int)head_pitch - (int)s_prev_pit;
-						if (dp >  MAX_STEP) head_pitch = (angle)(s_prev_pit + MAX_STEP);
-						else if (dp < -MAX_STEP) head_pitch = (angle)(s_prev_pit - MAX_STEP);
-
-						int dy = (int)head_yaw - (int)s_prev_yaw;   // normalize for wrap
-						while (dy >  NUMBER_OF_ANGLES / 2) dy -= NUMBER_OF_ANGLES;
-						while (dy < -NUMBER_OF_ANGLES / 2) dy += NUMBER_OF_ANGLES;
-						if (dy >  MAX_STEP) head_yaw = (angle)(s_prev_yaw + MAX_STEP);
-						else if (dy < -MAX_STEP) head_yaw = (angle)(s_prev_yaw - MAX_STEP);
-					}
-					s_prev_yaw  = head_yaw;
-					s_prev_pit  = head_pitch;
-					s_have_prev = true;
-				}
-
-				// Save the view fields we override.
-				const angle       s_yaw  = world_view->yaw;
-				const angle       s_pit  = world_view->pitch;
-				const fixed_angle s_vyaw = world_view->virtual_yaw;
-				const fixed_angle s_vpit = world_view->virtual_pitch;
-				const short       s_sw   = world_view->screen_width;
-				const short       s_sh   = world_view->screen_height;
-				const short       s_std  = world_view->standard_screen_width;
-				const float       s_fov  = world_view->field_of_view;
-				const bool        s_wep  = world_view->show_weapons_in_hand;
-
-				angle new_yaw   = NORMALIZE_ANGLE(s_yaw + head_yaw);
-				angle new_pitch = s_pit + head_pitch;
-				// CRITICAL: initialize_view_data() does an integer divide by
-				// cosine_table[pitch], a 512-entry array indexed by the SIGNED
-				// pitch with no NORMALIZE_ANGLE. cos is 0 at ±90 deg and a
-				// negative pitch reads BEFORE the array (OOB -> may be 0 ->
-				// divide by zero). The engine only ever uses small elevations
-				// (~±maximum_elevation), so keep pitch within that safe range.
-				// Stay clear of QUARTER_CIRCLE (90 deg), where cos(pitch)=0 and
-				// dtanpitch would divide by zero. ~78 deg gives comfortable head
-				// range with margin.
-				const angle PITCH_LIMIT = (NUMBER_OF_ANGLES / 4) - 16;   // ~78 deg
-				if (new_pitch >  PITCH_LIMIT) new_pitch =  PITCH_LIMIT;
-				if (new_pitch < -PITCH_LIMIT) new_pitch = -PITCH_LIMIT;
-
-				world_view->yaw           = new_yaw;
-				world_view->pitch         = new_pitch;
-				world_view->virtual_yaw   = (fixed_angle)new_yaw   * FIXED_ONE;
-				world_view->virtual_pitch = (fixed_angle)new_pitch * FIXED_ONE;
-				world_view->screen_width  = ew;
-				world_view->screen_height = eh;
-				world_view->standard_screen_width = ew;   // ratio 1: use field_of_view directly (like dual-FBO)
-				if (USE_XR_FOV)
-				{
-					const double hfov = ((double)xrfov[1] - (double)xrfov[0]) * 180.0 / PI;
-					if (hfov > 30.0 && hfov < 160.0)
-						world_view->field_of_view = (float)hfov;
-				}
-				world_view->show_weapons_in_hand = false;
-				initialize_view_data(world_view);
-
-				if (step_log) Aleph_OpenXR_LogLine("C1 step: pre-render");
-				xr_eye_fbo->activate(true);
-				render_view(world_view, software_render_dest.get());
-				xr_eye_fbo->deactivate();
-				if (step_log) Aleph_OpenXR_LogLine("C1 step: post-render");
-
-				Aleph_OpenXR_SetEyeSourceFbo(0, xr_eye_fbo->fbo(), ew, eh);
-
-				// Restore the monitor view state (leave the normal path intact).
-				world_view->yaw           = s_yaw;
-				world_view->pitch         = s_pit;
-				world_view->virtual_yaw   = s_vyaw;
-				world_view->virtual_pitch = s_vpit;
-				world_view->screen_width  = s_sw;
-				world_view->screen_height = s_sh;
-				world_view->standard_screen_width = s_std;
-				world_view->field_of_view = s_fov;
-				world_view->show_weapons_in_hand = s_wep;
-				initialize_view_data(world_view);
-
-				// Log the head->view mapping for the first few frames only
-				// (enough to confirm tracking is driving the camera).
-				static int xr_dbg = 0;
-				if (xr_dbg < 3)
-				{
-					++xr_dbg;
-					char buf[160];
-					snprintf(buf, sizeof(buf),
-						"C1 eye0: head_yaw=%d head_pitch=%d -> yaw=%d pitch=%d fov=%.1f",
-						(int)head_yaw, (int)head_pitch, (int)new_yaw, (int)new_pitch,
-						world_view->field_of_view);
-					Aleph_OpenXR_LogLine(buf);
-				}
-			}
+			const SDL_Rect& r = world_view->terminal_mode_active ? TermRect : MapRect;
+			const double s = MainScreenPixelScale();
+			const int capH = MainScreenPixelHeight();
+			const int sw = (int)lround(r.w * s), sh = (int)lround(r.h * s);
+			const int sx = (int)lround(r.x * s);
+			const int sy = capH - ((int)lround(r.y * s) + sh);   // GL bottom-left
+			Aleph_OpenXR_SetMirrorSrcRect(sx, sy, sw, sh);
 		}
 		else
 		{
-			Aleph_OpenXR_SetEyeSourceFbo(0, 0, 0, 0);
+			Aleph_OpenXR_SetMirrorSrcRect(0, 0, 0, 0);   // mirror full frame
 		}
 	}
+	Aleph_OpenXR_RenderEyes();
 #endif
 #endif
 	// Original line, just in case:

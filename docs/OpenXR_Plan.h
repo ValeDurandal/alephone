@@ -3,22 +3,45 @@
 // =====================================================================
 // CURRENT STATE / RESUME HERE   (update at the end of each milestone)
 // ---------------------------------------------------------------------
-// Last updated: 2026-08-04, after Step C1.
+// Last updated: 2026-08-05, Step C2 in progress (BOTH eyes head-tracked).
 // Branch: vr-mod
 //
-// Verified working (committed):
+// Verified working:
 //   - Step A: OpenXR swapchains created (2 views @ 2064x2272, sRGB8_alpha8).
 //   - Step B: persistent session + minimal frame loop; solid color in Quest;
 //     clean teardown on video-mode change and on app exit.
-//   - Step C0: the monitor frame is captured and MIRRORED into both eyes
-//     (right-side-up, stereo depth from the dual-FBO prototype, clean quit).
-//   - Step C1: the LEFT eye is a real, head-tracked engine render (camera from
-//     xrLocateViews orientation). Looking around moves the world in the headset;
-//     played for minutes. Right eye is still the C0 mirror. (See C1 section.)
-//     Known limits (map to C2/C3): environment WARPING (symmetric FOV + aspect
-//     stretch -> C2 asymmetric projection); occasional pose GLITCH; performance
-//     DEGRADES to unplayable after ~5 min (heavy 3x world render + blocking
-//     xrWaitFrame, single-threaded -> C3 pacing; possibly a residual leak).
+//   - Step C0: the monitor frame captured and MIRRORED into both eyes.
+//   - Step C1: LEFT eye head-tracked engine render (committed checkpoint).
+//   - Step C2 (playable, this checkpoint): BOTH eyes head-tracked; correct
+//     per-eye FOV read from the runtime (the engine inflates field_of_view 1.3x,
+//     so we set world_to_screen_* directly -> fixed the "zoomed" look);
+//     render==submit fov so the eyes FUSE with real stereo depth; fixed IPD
+//     (~64 WU, no per-frame spikes); monitor forced mono while XR active.
+//     Aiming: VIEW FOLLOWS AIM - view pitch tracks the player's mouse elevation
+//     (+/- small capped head assist) so the gun fires at view center. Eye offset
+//     guarded by polygon walk (find_new_object_polygon) + floor/ceiling height
+//     check to avoid rendering from a bad polygon near walls/stairs.
+//   - PITCH-DOWN GLITCH: FIXED. Root cause was a normalized-vs-signed angle bug:
+//     world_view->pitch is stored NORMALIZED [0,512) (looking down = ~469), but
+//     the clamp treated it as signed and slammed it to +PITCH_LIMIT (straight
+//     up). Now converted to signed before clamping (screen.cpp).
+//   - TERMINALS / overhead map in headset: mirror the monitor as a fused mono
+//     PANEL - clear the per-eye world source, give BOTH eyes the SAME symmetric
+//     fov (else the mono image doubles), and blit only the terminal/map REGION
+//     cropped + centered + scaled (PANEL ~0.65). Readable and fused.
+//
+// OPEN ISSUES (C2 polish / C3), next up:
+//   1. TERMINAL TEARING: the flat 2D panel shimmers/tears through the headset's
+//      reprojection (projection layers assume 3D depth). Proper fix: submit UI
+//      via an XrCompositionLayerQuad (dedicated flat-panel layer) instead.
+//   2. AIMING (head-yaw): view = facing + head_yaw but the gun uses facing, so
+//      turning your head puts the gun off view-center horizontally ("sometimes
+//      off"). Fix: cap head-yaw's influence, or "head drives the gun" (C3).
+//   3. HEAD TRACKING positional: rotation-only + FIXED IPD, NO translational
+//      tracking (leaning/moving your head doesn't move the camera). Wanted 6DoF.
+//   4. NEAR-object DOUBLE VISION: inherent VR near-fusion limit; later IPD tune.
+//   (Plus from C1: perf DEGRADES after ~5 min -> C3 pacing, single-threaded
+//    3x world render + blocking xrWaitFrame.)
 //
 // Key files:
 //   - Source_Files/RenderOther/OpenXR_Session.cpp / .h

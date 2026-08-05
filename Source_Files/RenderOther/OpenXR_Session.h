@@ -45,5 +45,18 @@ bool Aleph_OpenXR_GetEyePose(int eye, float outQuatXYZW[4],
 // consumes and clears it after use.
 void Aleph_OpenXR_SetEyeSourceFbo(int eye, unsigned int glFbo, int w, int h);
 
+// Override the FOV submitted in this eye's projection layer (radians, OpenXR
+// sign convention: left<=0, right>=0, up>=0, down<=0). Use this to make the
+// submitted fov match what the engine actually rendered so the eyes fuse.
+// Set each frame; consumed and cleared after use (falls back to runtime fov).
+void Aleph_OpenXR_SetEyeFov(int eye, float angleLeft, float angleRight,
+                            float angleUp, float angleDown);
+
 // Append a line to the OpenXR log (openxr_session.txt). For host-side debug.
 void Aleph_OpenXR_LogLine(const char* msg);
+
+// When mirroring the monitor into the eyes (terminals / overhead map), blit only
+// this sub-region of the captured frame, fit + centered in the eye, instead of
+// the whole stretched frame. Coords are in captured-framebuffer pixels with GL
+// bottom-left origin. Pass w<=0 to clear (mirror the full frame). Set each frame.
+void Aleph_OpenXR_SetMirrorSrcRect(int x, int y, int w, int h);
