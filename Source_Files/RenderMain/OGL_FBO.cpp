@@ -126,6 +126,7 @@ void FBO::draw_full(bool blend) {
 FBO::~FBO() {
 	glDeleteFramebuffersEXT(1, &_fbo);
 	glDeleteRenderbuffersEXT(1, &_depthBuffer);
+	glDeleteTextures(1, &texID);   // was leaked: the color texture is owned here
 }
 
 

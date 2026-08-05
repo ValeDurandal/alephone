@@ -66,9 +66,18 @@ GLuint g_captureFbo = 0;  // holds a copy of the last monitor frame
 GLuint g_captureTex = 0;
 int    g_capW = 0, g_capH = 0;
 
-FILE*  g_log       = nullptr;
-int    g_cycle     = 0;    // Init count this process (detects re-init churn)
-long   g_frameNum  = 0;    // frames since this cycle began rendering
+// C1: last located views + per-eye host-rendered source FBO to blit.
+XrView g_lastViews[2]     = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+bool   g_lastViewValid[2] = { false, false };
+GLuint g_eyeSrcFbo[2]     = { 0, 0 };
+int    g_eyeSrcW[2]       = { 0, 0 };
+int    g_eyeSrcH[2]       = { 0, 0 };
+
+FILE*  g_log        = nullptr;
+int    g_cycle      = 0;   // Init count this process (detects re-init churn)
+long   g_frameNum   = 0;   // frames since this cycle began rendering
+long   g_inGameLogN = 0;   // frames logged where a host eye source was present
+bool   g_logThisFrame = false;
 
 void L(const char* fmt, ...)
 {
@@ -266,15 +275,27 @@ bool RenderEyeImage(int eye, GLuint texture, int32_t w, int32_t h)
     glClearColor(0.10f, 0.55f, 0.60f, 1.0f);   // teal fallback base
     glClear(GL_COLOR_BUFFER_BIT);
 
+    // Prefer a host-rendered eye image (C1: real head-driven engine render for
+    // this eye); otherwise fall back to mirroring the monitor frame (C0).
     bool blitted = false;
-    if (g_captureFbo && g_capW > 0 && g_capH > 0) {
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_captureFbo);
+    GLuint srcFbo = 0; int srcW = 0, srcH = 0;
+    if (eye >= 0 && eye < 2 && g_eyeSrcFbo[eye]) {
+        srcFbo = g_eyeSrcFbo[eye]; srcW = g_eyeSrcW[eye]; srcH = g_eyeSrcH[eye];
+    } else if (g_captureFbo && g_capW > 0 && g_capH > 0) {
+        srcFbo = g_captureFbo; srcW = g_capW; srcH = g_capH;
+    }
+    if (g_logThisFrame)
+        L("  blit eye=%d srcFbo=%u src=%dx%d dst=%dx%d", eye,
+          (unsigned)srcFbo, srcW, srcH, (int)w, (int)h);
+
+    if (srcFbo && srcW > 0 && srcH > 0) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, srcFbo);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_fbo);
         glDisable(GL_FRAMEBUFFER_SRGB);
         // Straight copy (no Y flip): the OpenGL swapchain image shares GL's
-        // bottom-left origin with our capture, so the orientation already
+        // bottom-left origin with our source, so the orientation already
         // matches what the compositor expects.
-        glBlitFramebuffer(0, 0, g_capW, g_capH, 0, 0, w, h,
+        glBlitFramebuffer(0, 0, srcW, srcH, 0, 0, w, h,
             GL_COLOR_BUFFER_BIT, GL_LINEAR);
         blitted = true;
     }
@@ -371,6 +392,11 @@ void Aleph_OpenXR_Frame()
     PollEvents();
     if (!g_sessionRunning) return;   // not begun yet, or stopping
 
+    // Log the first ~20 IN-GAME frames (where the host handed us an eye image),
+    // regardless of how many menu frames preceded them.
+    g_logThisFrame = (g_eyeSrcFbo[0] != 0) && (g_inGameLogN < 20);
+    if (g_logThisFrame) ++g_inGameLogN;
+
     XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
     XrFrameState    frameState{ XR_TYPE_FRAME_STATE };
     if (!XR_SUCCEEDED(xrWaitFrame(g_session, &waitInfo, &frameState))) return;
@@ -408,6 +434,18 @@ void Aleph_OpenXR_Frame()
         const bool orientationValid = (viewFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
         const bool positionValid    = (viewFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
         posesValid = orientationValid && positionValid;
+
+        // Stash the located views so the host can drive an eye camera next
+        // frame (C1). Only latch when the ORIENTATION is valid: during a brief
+        // tracking hiccup the runtime may report success with a garbage/identity
+        // quaternion, which would snap the view (e.g. straight up). Holding the
+        // last good pose keeps the view steady until tracking re-locks.
+        if (XR_SUCCEEDED(locateResult) && orientationValid) {
+            for (uint32_t i = 0; i < viewCountOut && i < 2; ++i) {
+                g_lastViews[i]     = views[i];
+                g_lastViewValid[i] = true;
+            }
+        }
 
         // Render whenever the locate call itself succeeded. A projection layer
         // only needs a *structurally* valid pose, not a good tracking lock, so
@@ -468,16 +506,23 @@ void Aleph_OpenXR_Frame()
     endInfo.layers               = layers;
     XrResult endResult = xrEndFrame(g_session, &endInfo);
 
+    const int xrSrc0 = g_eyeSrcFbo[0] ? 1 : 0;   // did the host drive eye 0?
+
+    // Consume the host eye sources: they are set fresh each frame by the game's
+    // render pass, so clearing here makes us fall back to the mirror whenever
+    // that pass didn't run (e.g. menus).
+    g_eyeSrcFbo[0] = g_eyeSrcFbo[1] = 0;
+
     // Quiet diagnostics: log the first few frames of each cycle (enough to
     // confirm the loop is submitting real layers), plus any frame where
     // xrEndFrame reports an error. No steady-state per-frame spam.
     ++g_frameNum;
-    if (g_frameNum <= 3 || !XR_SUCCEEDED(endResult)) {
+    if (g_frameNum <= 3 || g_logThisFrame || !XR_SUCCEEDED(endResult)) {
         L("frame %ld: shouldRender=%d locate=%d viewFlags=0x%llx posesValid=%d "
-          "eyes=%d mirrorEyes=%d cap=%dx%d layerCount=%u endFrame=%d",
+          "eyes=%d mirrorEyes=%d xrEye0=%d cap=%dx%d layerCount=%u endFrame=%d",
           g_frameNum, (int)frameState.shouldRender, (int)locateResult,
           (unsigned long long)viewFlags, (int)posesValid, eyesRendered,
-          mirrorEyes, g_capW, g_capH, layerCount, (int)endResult);
+          mirrorEyes, xrSrc0, g_capW, g_capH, layerCount, (int)endResult);
     }
 }
 
@@ -487,6 +532,9 @@ void Aleph_OpenXR_Shutdown()
     if (g_captureFbo) { glDeleteFramebuffers(1, &g_captureFbo); g_captureFbo = 0; }
     if (g_captureTex) { glDeleteTextures(1, &g_captureTex);     g_captureTex = 0; }
     g_capW = g_capH = 0;
+
+    g_lastViewValid[0] = g_lastViewValid[1] = false;
+    g_eyeSrcFbo[0] = g_eyeSrcFbo[1] = 0;
 
     if (g_sessionRunning) { xrEndSession(g_session); g_sessionRunning = false; }
 
@@ -511,4 +559,40 @@ void Aleph_OpenXR_Shutdown()
 bool Aleph_OpenXR_IsActive()
 {
     return g_active;
+}
+
+// --- C1 -------------------------------------------------------------------
+
+void Aleph_OpenXR_GetEyeImageSize(int eye, int* w, int* h)
+{
+    if (w) *w = 0;
+    if (h) *h = 0;
+    if (!g_active || eye < 0 || eye >= (int)g_swapchains.size()) return;
+    if (w) *w = g_swapchains[eye].width;
+    if (h) *h = g_swapchains[eye].height;
+}
+
+bool Aleph_OpenXR_GetEyePose(int eye, float q[4], float p[3], float fovLRUD[4])
+{
+    if (!g_active || eye < 0 || eye >= 2 || !g_lastViewValid[eye]) return false;
+    const XrView& v = g_lastViews[eye];
+    if (q) { q[0]=v.pose.orientation.x; q[1]=v.pose.orientation.y;
+             q[2]=v.pose.orientation.z; q[3]=v.pose.orientation.w; }
+    if (p) { p[0]=v.pose.position.x; p[1]=v.pose.position.y; p[2]=v.pose.position.z; }
+    if (fovLRUD) { fovLRUD[0]=v.fov.angleLeft;  fovLRUD[1]=v.fov.angleRight;
+                   fovLRUD[2]=v.fov.angleUp;    fovLRUD[3]=v.fov.angleDown; }
+    return true;
+}
+
+void Aleph_OpenXR_SetEyeSourceFbo(int eye, unsigned int glFbo, int w, int h)
+{
+    if (eye < 0 || eye >= 2) return;
+    g_eyeSrcFbo[eye] = (GLuint)glFbo;
+    g_eyeSrcW[eye]   = w;
+    g_eyeSrcH[eye]   = h;
+}
+
+void Aleph_OpenXR_LogLine(const char* msg)
+{
+    if (msg) L("%s", msg);
 }

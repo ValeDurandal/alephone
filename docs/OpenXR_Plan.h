@@ -3,7 +3,7 @@
 // =====================================================================
 // CURRENT STATE / RESUME HERE   (update at the end of each milestone)
 // ---------------------------------------------------------------------
-// Last updated: 2026-08-04, after Step C0.
+// Last updated: 2026-08-04, after Step C1.
 // Branch: vr-mod
 //
 // Verified working (committed):
@@ -12,7 +12,13 @@
 //     clean teardown on video-mode change and on app exit.
 //   - Step C0: the monitor frame is captured and MIRRORED into both eyes
 //     (right-side-up, stereo depth from the dual-FBO prototype, clean quit).
-//     NOTE: this is a mirror, not head-tracked per-eye rendering yet.
+//   - Step C1: the LEFT eye is a real, head-tracked engine render (camera from
+//     xrLocateViews orientation). Looking around moves the world in the headset;
+//     played for minutes. Right eye is still the C0 mirror. (See C1 section.)
+//     Known limits (map to C2/C3): environment WARPING (symmetric FOV + aspect
+//     stretch -> C2 asymmetric projection); occasional pose GLITCH; performance
+//     DEGRADES to unplayable after ~5 min (heavy 3x world render + blocking
+//     xrWaitFrame, single-threaded -> C3 pacing; possibly a residual leak).
 //
 // Key files:
 //   - Source_Files/RenderOther/OpenXR_Session.cpp / .h
@@ -37,22 +43,33 @@
 //     frame N: shouldRender=1 locate=0 viewFlags=0xf posesValid=1 eyes=2
 //              mirrorEyes=2 cap=WxH layerCount=1 endFrame=0
 //
-// HARD CONSTRAINTS (learned the hard way in C0 — see the C0 section below):
+// HARD CONSTRAINTS (learned the hard way — see the C0/C1 sections below):
 //   1. Per-eye engine rendering must target an ENGINE `FBO` (so it joins the
 //      renderer's FBO active_chain), NOT a raw glBindFramebuffer — otherwise
 //      render_view's pixels land in FB0, not the swapchain.
 //   2. Never call render_view() from MainScreenSwap / the present path: outside
 //      the engine's render pass the texture manager state is invalid during
-//      transitions -> read AV in the texture manager (CTState).
+//      transitions -> read AV in the texture manager (CTState). C1 renders the
+//      eye inside render_screen (valid pass) into an engine FBO, then blits that
+//      FBO into the swapchain in Frame() (a safe texture copy).
 //   3. Capture->eye blit is a STRAIGHT copy, no Y flip (GL bottom-left origin
 //      matches the GL swapchain image).
 //   4. Keep the monitor dual-FBO stereo path working; every OpenXR entry point
 //      is a no-op when the session is inactive.
+//   5. Render the XR eye at the MONITOR viewport size, not the full 2064x2272
+//      swapchain size: a huge render FBO crashed on level load, and mismatched
+//      sizes churn the renderer's FBOs. Blit scales up to the swapchain.
+//   6. view_data.pitch is a SIGNED angle used to index the 512-entry trig
+//      tables. render.cpp now NORMALIZE_ANGLEs that index (was OOB/divide-by-
+//      zero for negative or large pitch). Still keep |pitch| < QUARTER_CIRCLE
+//      (cos=0 at 90 deg). Angle units: 512 = full circle (rad * 512/2pi).
 //
-// NEXT: Step C1 — drive ONE eye's view_data from the real xrLocateViews
-//   pose/FOV (head-tracked camera), rendered via an engine FBO into that eye's
-//   swapchain image. Then C2: both eyes from runtime views; retire the invented
-//   dual-FBO offsets when XR is active. (Details at the bottom of this file.)
+// NEXT: Step C2 — proper per-eye projection from the runtime XrFovf (asymmetric,
+//   off-center; the engine supports off-center via view->half_screen_width) at
+//   the correct eye aspect, for BOTH eyes from their xrLocateViews poses. This
+//   is what fixes the C1 environment warping. Retire the invented dual-FBO
+//   offsets when XR is active. Then C3: pacing (decouple xrWaitFrame from the
+//   main thread) to fix the perf degradation; HUD/weapons policy; mirror policy.
 // =====================================================================
 //
 // Prerequisite already done:
@@ -296,3 +313,70 @@
 //    (head-tracked camera), rendered via an engine FBO into that eye's
 //    swapchain image. Then C2: both eyes from runtime views; retire the
 //    invented dual-FBO offsets when XR is active.
+//
+//
+// ## Progress summary (as of 2026-08-04) — Step C1 COMPLETE (with caveats)
+//
+// Goal of C1: one eye (left) follows the headset — camera from the real
+// xrLocateViews pose, real engine render for that eye. ACHIEVED: looking around
+// moves the world in the left eye; played for minutes.
+//
+// ### How it works (the pattern that finally stuck)
+//  - `OpenXR_Session` stores the last-located views and exposes the pose:
+//    `Aleph_OpenXR_GetEyePose(eye, XrPosef*, XrFovf*)`,
+//    `Aleph_OpenXR_GetEyeImageSize()`, and
+//    `Aleph_OpenXR_SetEyeSourceFbo(eye, glFbo, w, h)` — a GL FBO the session
+//    blits into that eye's swapchain instead of the mirror (0 => fall back).
+//  - `screen.cpp` render_screen, AFTER the dual-FBO block (inside the valid
+//    render pass, textures live): if XR active + in game + pose available,
+//    render the LEFT eye into a persistent ENGINE `FBO` (so it joins the
+//    renderer active_chain) at the MONITOR VIEWPORT SIZE, then hand that FBO to
+//    the session. `Frame()` blits it into the left swapchain (straight copy).
+//    Right eye stays the C0 mirror. Pose lags by ~1 frame (uses last frame's
+//    locate); fine for C1.
+//  - Added a 1-line getter `FBO::fbo()` (OGL_FBO.h) so the session can blit
+//    from the engine FBO.
+//
+// ### Pose -> Marathon camera (rotation only for C1)
+//  - Angles: 512 = full circle, so angle_units = radians * 512/(2*pi).
+//  - Rotate forward (0,0,-1) by the pose quaternion (LOCAL space, +Y up,-Z fwd):
+//      fx=-2(xz+wy)  fy=-2(yz-wx)  fz=-(1-2(x^2+y^2))
+//      head_yaw   = atan2(fx,-fz) * 512/2pi   (YAW_SIGN tunable)
+//      head_pitch = asin(fy)      * 512/2pi   (PITCH_SIGN tunable)
+//  - world_view->yaw = NORMALIZE_ANGLE(player_facing + head_yaw); pitch =
+//    clamp(player_elevation + head_pitch, +/-PITCH_LIMIT ~78 deg). Set
+//    virtual_yaw/pitch = angle * FIXED_ONE. FOV from XrFovf horizontal (approx,
+//    symmetric — the real fix is C2). Origin unchanged (no head translation yet).
+//  - Head angles are RATE-LIMITED (~22 deg/frame) to bound tracking spikes.
+//
+// ### Bugs found & fixed IN SHARED ENGINE CODE (both latent, pre-existing)
+//   1. Divide-by-zero: render.cpp:621 `dtanpitch = .../cosine_table[view->pitch]`
+//      indexed the 512-entry table with the SIGNED pitch and no NORMALIZE.
+//      Negative pitch read out of bounds (could hit 0); exactly +/-90 deg is 0.
+//      Fixed by NORMALIZE_ANGLE-ing the index. Callers still keep |pitch| < 90.
+//   2. Texture leak: FBO::~FBO() freed the framebuffer + depth buffer but NOT
+//      its color texture (texID). Any FBO recreation leaked a texture. Fixed by
+//      adding glDeleteTextures in the destructor.
+//
+// ### Crash trail (for future reference — all resolved)
+//   - render_view into the full 2064x2272 swapchain-size FBO crashed on level
+//     load. Fix: render at the monitor viewport size, blit-scale to the eye.
+//   - Non-ASCII in a comment / a stray "*/" in render.cpp broke the build.
+//   - "Snap straight up" was invalid-orientation poses driving the camera; now
+//     the pose only latches when the orientation-valid bit is set.
+//
+// ### Known limitations (NOT bugs — these define C2 / C3)
+//  - WARPING / wrong perspective: symmetric FOV + stretch from viewport aspect
+//    to the ~square eye. C2 fixes this with true asymmetric per-eye projection.
+//  - Only the LEFT eye is head-tracked; right eye is the mirror. C2 does both.
+//  - PERFORMANCE degrades to unplayable after ~5 min: 3x world render/frame +
+//    2 big blits + blocking xrWaitFrame, all single-threaded, so normal scene
+//    growth tips past the VR frame budget (reprojection). C3 = pacing/decouple.
+//    (Could also hide a residual leak; needs profiling.)
+//  - Occasional pose glitch remains; revisit with C2 projection + C3 pacing.
+//
+// ### Next: C2
+//  - Build the projection from XrFovf per eye (asymmetric/off-center via
+//    view->half_screen_width) at the correct eye aspect; render BOTH eyes from
+//    their xrLocateViews poses; stop using the invented dual-FBO offsets when
+//    XR is active. Then C3 for pacing + HUD/weapons + mirror policy.

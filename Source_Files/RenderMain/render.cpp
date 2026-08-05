@@ -618,7 +618,16 @@ static void update_view_data(
 	}
 	
 	/* calculate world_to_screen_y*tan(pitch) */
-	view->dtanpitch= (view->world_to_screen_y*sine_table[view->pitch])/cosine_table[view->pitch];
+	// NORMALIZE_ANGLE keeps the index inside the [0,NUMBER_OF_ANGLES) trig
+	// tables. pitch can be negative (looking down) and, with VR head tracking,
+	// larger than the usual player elevation; sin/cos are periodic so this is
+	// identical for normal angles but no longer reads out of bounds (a negative
+	// pitch used to index before cosine_table[] and could divide by zero).
+	// cos is still 0 at exactly +/-90 deg, so callers must keep abs(pitch) < QUARTER_CIRCLE.
+	{
+		const angle _np = NORMALIZE_ANGLE(view->pitch);
+		view->dtanpitch= (view->world_to_screen_y*sine_table[_np])/cosine_table[_np];
+	}
 
 	/* calculate left cone vector */
 	theta= NORMALIZE_ANGLE(view->yaw-view->half_cone);

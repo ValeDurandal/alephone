@@ -53,7 +53,9 @@ public:
 	void prepare_drawing_mode(bool blend = false);
 	void reset_drawing_mode();
 	void draw_full(bool blend = false);
-	
+
+	GLuint fbo() const { return _fbo; }   // for blitting the result elsewhere (OpenXR)
+
 	static FBO *active_fbo();
 };
 

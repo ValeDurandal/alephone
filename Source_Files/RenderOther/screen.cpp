@@ -1580,6 +1580,174 @@ void render_screen(short ticks_elapsed)
 	{
 		render_view(world_view, software_render_dest.get());
 	}
+
+#if defined (__WIN32__)
+	// --- C1: render the LEFT eye with a head-tracked camera into an engine
+	// FBO, then hand it to the OpenXR frame to blit into the left swapchain.
+	// This runs INSIDE render_screen (textures valid, engine FBO joins the
+	// renderer's active_chain) to avoid the C0 mid-present crash. Rotation-only
+	// for now; the pose lags head motion by ~one frame. No-op unless the
+	// OpenXR session is active and we are in a live game.
+	if (Aleph_OpenXR_IsActive() && get_game_state() == _game_in_progress &&
+	    world_view && world_view->origin_polygon_index >= 0)
+	{
+		float xrq[4], xrp[3], xrfov[4];   // quat xyzw, pos xyz, fov L/R/U/D (rad)
+		if (Aleph_OpenXR_GetEyePose(0, xrq, xrp, xrfov))
+		{
+			// Render at the CURRENT monitor viewport size (the scale the engine
+			// just rendered at), then blit-scale into the eye. Avoids resizing
+			// the shader renderer's internal FBOs to the huge swapchain size;
+			// matches the dual-FBO prototype's proven pattern.
+			GLint xrvp[4] = { 0, 0, 0, 0 };
+			glGetIntegerv(GL_VIEWPORT, xrvp);
+			const int ew = xrvp[2] > 0 ? xrvp[2] : 640;
+			const int eh = xrvp[3] > 0 ? xrvp[3] : 480;
+
+			static int xr_calls = 0;
+			const bool step_log = (xr_calls < 5);
+			++xr_calls;
+			if (step_log) { char b[96]; snprintf(b, sizeof(b),
+				"C1 step: enter ew=%d eh=%d poly=%d", ew, eh,
+				(int)world_view->origin_polygon_index); Aleph_OpenXR_LogLine(b); }
+
+			{
+				static FBO* xr_eye_fbo = nullptr;
+				if (!xr_eye_fbo || (int)xr_eye_fbo->_w != ew || (int)xr_eye_fbo->_h != eh)
+				{
+					delete xr_eye_fbo;
+					xr_eye_fbo = new FBO(ew, eh);
+				}
+				if (step_log) Aleph_OpenXR_LogLine("C1 step: fbo ready");
+
+				// Tunables — flip a sign if head motion goes the wrong way.
+				const int  YAW_SIGN   = +1;
+				const int  PITCH_SIGN = +1;
+				const bool USE_XR_FOV = true;
+				const double PI = 3.14159265358979323846;
+
+				// pose orientation (LOCAL space, +Y up, -Z fwd) -> forward vec
+				const float qx = xrq[0], qy = xrq[1];
+				const float qz = xrq[2], qw = xrq[3];
+				const float fwx = -2.0f * (qx * qz + qw * qy);
+				float       fwy = -2.0f * (qy * qz - qw * qx);
+				const float fwz = -(1.0f - 2.0f * (qx * qx + qy * qy));
+				if (fwy >  1.0f) fwy =  1.0f;
+				if (fwy < -1.0f) fwy = -1.0f;
+				const double yaw_rad   = atan2((double)fwx, (double)(-fwz));
+				const double pitch_rad = asin((double)fwy);
+				const double to_units  = (double)NUMBER_OF_ANGLES / (2.0 * PI);
+				angle head_yaw   = (angle)(lround(yaw_rad   * to_units) * YAW_SIGN);
+				angle head_pitch = (angle)(lround(pitch_rad * to_units) * PITCH_SIGN);
+
+				// Spike smoothing: rate-limit the head angles frame to frame.
+				// Real head motion is at most ~10 angle-units/frame, so a cap well
+				// above that passes normal motion through untouched, but bounds a
+				// sudden tracking spike (a valid-but-wrong pose that would snap the
+				// view, e.g. straight up) to a small step that recovers next frame.
+				{
+					static angle s_prev_yaw = 0, s_prev_pit = 0;
+					static bool  s_have_prev = false;
+					const int MAX_STEP = 32;   // ~22 deg/frame; far above real motion
+					if (s_have_prev)
+					{
+						int dp = (int)head_pitch - (int)s_prev_pit;
+						if (dp >  MAX_STEP) head_pitch = (angle)(s_prev_pit + MAX_STEP);
+						else if (dp < -MAX_STEP) head_pitch = (angle)(s_prev_pit - MAX_STEP);
+
+						int dy = (int)head_yaw - (int)s_prev_yaw;   // normalize for wrap
+						while (dy >  NUMBER_OF_ANGLES / 2) dy -= NUMBER_OF_ANGLES;
+						while (dy < -NUMBER_OF_ANGLES / 2) dy += NUMBER_OF_ANGLES;
+						if (dy >  MAX_STEP) head_yaw = (angle)(s_prev_yaw + MAX_STEP);
+						else if (dy < -MAX_STEP) head_yaw = (angle)(s_prev_yaw - MAX_STEP);
+					}
+					s_prev_yaw  = head_yaw;
+					s_prev_pit  = head_pitch;
+					s_have_prev = true;
+				}
+
+				// Save the view fields we override.
+				const angle       s_yaw  = world_view->yaw;
+				const angle       s_pit  = world_view->pitch;
+				const fixed_angle s_vyaw = world_view->virtual_yaw;
+				const fixed_angle s_vpit = world_view->virtual_pitch;
+				const short       s_sw   = world_view->screen_width;
+				const short       s_sh   = world_view->screen_height;
+				const short       s_std  = world_view->standard_screen_width;
+				const float       s_fov  = world_view->field_of_view;
+				const bool        s_wep  = world_view->show_weapons_in_hand;
+
+				angle new_yaw   = NORMALIZE_ANGLE(s_yaw + head_yaw);
+				angle new_pitch = s_pit + head_pitch;
+				// CRITICAL: initialize_view_data() does an integer divide by
+				// cosine_table[pitch], a 512-entry array indexed by the SIGNED
+				// pitch with no NORMALIZE_ANGLE. cos is 0 at ±90 deg and a
+				// negative pitch reads BEFORE the array (OOB -> may be 0 ->
+				// divide by zero). The engine only ever uses small elevations
+				// (~±maximum_elevation), so keep pitch within that safe range.
+				// Stay clear of QUARTER_CIRCLE (90 deg), where cos(pitch)=0 and
+				// dtanpitch would divide by zero. ~78 deg gives comfortable head
+				// range with margin.
+				const angle PITCH_LIMIT = (NUMBER_OF_ANGLES / 4) - 16;   // ~78 deg
+				if (new_pitch >  PITCH_LIMIT) new_pitch =  PITCH_LIMIT;
+				if (new_pitch < -PITCH_LIMIT) new_pitch = -PITCH_LIMIT;
+
+				world_view->yaw           = new_yaw;
+				world_view->pitch         = new_pitch;
+				world_view->virtual_yaw   = (fixed_angle)new_yaw   * FIXED_ONE;
+				world_view->virtual_pitch = (fixed_angle)new_pitch * FIXED_ONE;
+				world_view->screen_width  = ew;
+				world_view->screen_height = eh;
+				world_view->standard_screen_width = ew;   // ratio 1: use field_of_view directly (like dual-FBO)
+				if (USE_XR_FOV)
+				{
+					const double hfov = ((double)xrfov[1] - (double)xrfov[0]) * 180.0 / PI;
+					if (hfov > 30.0 && hfov < 160.0)
+						world_view->field_of_view = (float)hfov;
+				}
+				world_view->show_weapons_in_hand = false;
+				initialize_view_data(world_view);
+
+				if (step_log) Aleph_OpenXR_LogLine("C1 step: pre-render");
+				xr_eye_fbo->activate(true);
+				render_view(world_view, software_render_dest.get());
+				xr_eye_fbo->deactivate();
+				if (step_log) Aleph_OpenXR_LogLine("C1 step: post-render");
+
+				Aleph_OpenXR_SetEyeSourceFbo(0, xr_eye_fbo->fbo(), ew, eh);
+
+				// Restore the monitor view state (leave the normal path intact).
+				world_view->yaw           = s_yaw;
+				world_view->pitch         = s_pit;
+				world_view->virtual_yaw   = s_vyaw;
+				world_view->virtual_pitch = s_vpit;
+				world_view->screen_width  = s_sw;
+				world_view->screen_height = s_sh;
+				world_view->standard_screen_width = s_std;
+				world_view->field_of_view = s_fov;
+				world_view->show_weapons_in_hand = s_wep;
+				initialize_view_data(world_view);
+
+				// Log the head->view mapping for the first few frames only
+				// (enough to confirm tracking is driving the camera).
+				static int xr_dbg = 0;
+				if (xr_dbg < 3)
+				{
+					++xr_dbg;
+					char buf[160];
+					snprintf(buf, sizeof(buf),
+						"C1 eye0: head_yaw=%d head_pitch=%d -> yaw=%d pitch=%d fov=%.1f",
+						(int)head_yaw, (int)head_pitch, (int)new_yaw, (int)new_pitch,
+						world_view->field_of_view);
+					Aleph_OpenXR_LogLine(buf);
+				}
+			}
+		}
+		else
+		{
+			Aleph_OpenXR_SetEyeSourceFbo(0, 0, 0, 0);
+		}
+	}
+#endif
 #endif
 	// Original line, just in case:
 	//render_view(world_view, software_render_dest.get());

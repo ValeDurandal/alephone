@@ -24,3 +24,26 @@ void Aleph_OpenXR_CaptureFromDefaultFramebuffer(int w, int h);
 void Aleph_OpenXR_Frame();
 void Aleph_OpenXR_Shutdown();
 bool Aleph_OpenXR_IsActive();
+
+// --- C1: per-eye real render driven by head pose --------------------------
+
+// Recommended swapchain image size for an eye (0 = left, 1 = right).
+void Aleph_OpenXR_GetEyeImageSize(int eye, int* w, int* h);
+
+// Last pose + FOV that xrLocateViews returned for an eye (LOCAL space). Filled
+// as plain floats so this header needs no OpenXR types: orientation quaternion
+// (x,y,z,w), position (x,y,z) in meters, FOV angles (left,right,up,down) in
+// radians. Any pointer may be null. Returns true if a pose has been located
+// (may lag the current head pose by one frame).
+bool Aleph_OpenXR_GetEyePose(int eye, float outQuatXYZW[4],
+                             float outPosXYZ[3], float outFovLRUD[4]);
+
+// Hand the session a GL framebuffer whose color attachment holds a freshly
+// rendered eye image (w x h). Aleph_OpenXR_Frame() blits it into that eye's
+// swapchain image instead of the monitor mirror. Pass glFbo = 0 to clear the
+// source for this eye (falls back to the mirror). Set each frame; the session
+// consumes and clears it after use.
+void Aleph_OpenXR_SetEyeSourceFbo(int eye, unsigned int glFbo, int w, int h);
+
+// Append a line to the OpenXR log (openxr_session.txt). For host-side debug.
+void Aleph_OpenXR_LogLine(const char* msg);
