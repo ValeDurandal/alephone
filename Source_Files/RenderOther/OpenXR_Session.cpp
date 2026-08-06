@@ -274,6 +274,13 @@ bool RenderEyeImage(int eye, GLuint texture, int32_t w, int32_t h)
             L("WARN: eye FBO incomplete: 0x%x", (unsigned)status);
     }
 
+    // The engine leaves GL_SCISSOR_TEST enabled (clipped to the monitor view
+    // rect). That would clip BOTH the clear and the blit to a small box, leaving
+    // most of the eye image holding stale swapchain content (old frames -> the
+    // "doubled/static/flicker" behind the terminal panel). Disable it here.
+    const GLboolean scissorWas = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
+
     glViewport(0, 0, w, h);
     glClearColor(0.10f, 0.55f, 0.60f, 1.0f);   // teal fallback base
     glClear(GL_COLOR_BUFFER_BIT);
@@ -320,12 +327,21 @@ bool RenderEyeImage(int eye, GLuint texture, int32_t w, int32_t h)
         blitted = true;
     }
 
+    // Force the swapchain image fully opaque. The captured monitor frame (esp. a
+    // terminal, a 2D blit) can carry alpha < 1, and the compositor treats that as
+    // transparent -> a see-through / flickering panel. Overwrite alpha only.
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
     // Detach and restore the framebuffer bindings the game expects.
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_fbo);
     glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
         GL_TEXTURE_2D, 0, 0);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevRead);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prevDraw);
+    if (scissorWas) glEnable(GL_SCISSOR_TEST);   // restore the game's state
     return blitted;
 }
 
@@ -357,12 +373,16 @@ void CaptureDefaultFramebuffer(int w, int h)
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDraw);
 
+    const GLboolean scissorWas = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);   // else the copy is clipped to the game's view rect
+
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);            // the just-drawn frame
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_captureFbo);
     glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevRead);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prevDraw);
+    if (scissorWas) glEnable(GL_SCISSOR_TEST);
 }
 
 } // namespace
@@ -473,6 +493,25 @@ void Aleph_OpenXR_Frame()
         // before/without full tracking (headset still establishing, on a desk).
         if (XR_SUCCEEDED(locateResult) && viewCountOut > 0) {
             projViews.resize(viewCountOut);
+
+            // Mirror mode: no per-eye world render this frame (terminals, menus,
+            // dialogs, or tracking-loss fallback) -> both eyes show the SAME mono
+            // image. A projection layer normally wants a distinct per-eye pose+fov;
+            // feeding a mono image through that makes it render slightly different
+            // per eye -> a shifted/warped "ghost" beside the content. Give both
+            // eyes an IDENTICAL pose + symmetric fov so it fuses as one flat panel.
+            const bool mirrorMode = (g_eyeSrcFbo[0] == 0 && g_eyeSrcFbo[1] == 0);
+            XrPosef commonPose = views[0].pose;
+            if (!orientationValid) commonPose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+            if (!positionValid)    commonPose.position    = { 0.0f, 0.0f, 0.0f };
+            XrFovf commonFov = views[0].fov;
+            {
+                const float hh = 0.5f * (commonFov.angleRight - commonFov.angleLeft);
+                const float vv = 0.5f * (commonFov.angleUp - commonFov.angleDown);
+                commonFov.angleLeft = -hh; commonFov.angleRight = hh;
+                commonFov.angleUp   =  vv; commonFov.angleDown  = -vv;
+            }
+
             for (uint32_t i = 0; i < viewCountOut; ++i) {
                 SwapchainInfo& sc = g_swapchains[i];
 
@@ -502,8 +541,13 @@ void Aleph_OpenXR_Frame()
 
                 XrCompositionLayerProjectionView& pv = projViews[i];
                 pv = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
-                pv.pose = pose;
-                pv.fov  = (i < 2 && g_eyeFovSet[i]) ? g_eyeFov[i] : views[i].fov;
+                if (mirrorMode) {
+                    pv.pose = commonPose;   // identical for both eyes -> fuses flat
+                    pv.fov  = commonFov;
+                } else {
+                    pv.pose = pose;
+                    pv.fov  = (i < 2 && g_eyeFovSet[i]) ? g_eyeFov[i] : views[i].fov;
+                }
                 pv.subImage.swapchain               = sc.handle;
                 pv.subImage.imageArrayIndex         = 0;
                 pv.subImage.imageRect.offset        = { 0, 0 };

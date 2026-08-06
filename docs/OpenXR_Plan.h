@@ -25,15 +25,28 @@
 //     world_view->pitch is stored NORMALIZED [0,512) (looking down = ~469), but
 //     the clamp treated it as signed and slammed it to +PITCH_LIMIT (straight
 //     up). Now converted to signed before clamping (screen.cpp).
-//   - TERMINALS / overhead map in headset: mirror the monitor as a fused mono
-//     PANEL - clear the per-eye world source, give BOTH eyes the SAME symmetric
-//     fov (else the mono image doubles), and blit only the terminal/map REGION
-//     cropped + centered + scaled (PANEL ~0.65). Readable and fused.
+//   - 2D OVERLAYS (terminals, overhead map, menus, dialogs, save screen) in
+//     headset: mirror the monitor as a fused mono PANEL. In terminal/map mode
+//     RenderEyes() clears the per-eye world source and crops the mirror to just
+//     the terminal/map REGION, centered + scaled (PANEL ~0.65). In Frame(), any
+//     "mirror" frame (no per-eye world source) submits BOTH eyes IDENTICALLY -
+//     same pose + symmetric fov - so the mono image fuses instead of doubling.
+//     Also: force swapchain alpha opaque (2D blits carry alpha<1 -> compositor
+//     shows them see-through), scissor disabled around the blit. READABLE and
+//     mostly fused, BUT see open issue #1 (residual ghost/smear).
 //
 // OPEN ISSUES (C2 polish / C3), next up:
-//   1. TERMINAL TEARING: the flat 2D panel shimmers/tears through the headset's
-//      reprojection (projection layers assume 3D depth). Proper fix: submit UI
-//      via an XrCompositionLayerQuad (dedicated flat-panel layer) instead.
+//   1. 2D OVERLAY GHOST/SMEAR (next task): mirrored terminals/menus still show a
+//      faint ghost that "blasts out the sides" and flickers at the edges. Root
+//      cause: we submit flat 2D through a PROJECTION LAYER, which the compositor
+//      reprojects as if it had 3D depth -> flat content smears. Matching per-eye
+//      pose+fov, symmetric fov, opaque alpha, and scissor all helped but can't
+//      fully fix it - wrong layer TYPE for 2D. PROPER FIX: XrCompositionLayerQuad
+//      (a dedicated flat-panel layer). Plan: add a mono UI swapchain + a scratch
+//      FBO, render the cropped 2D content into it, create a VIEW-reference space,
+//      and in mirror mode submit a head-locked quad (pose ~ (0,0,-2 m), sized to
+//      the UI aspect) INSTEAD of the projection layer. Expect 1-2 iterations to
+//      tune distance/size.
 //   2. AIMING (head-yaw): view = facing + head_yaw but the gun uses facing, so
 //      turning your head puts the gun off view-center horizontally ("sometimes
 //      off"). Fix: cap head-yaw's influence, or "head drives the gun" (C3).
