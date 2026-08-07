@@ -48,7 +48,16 @@ struct SwapchainInfo {
 XrInstance    g_instance = XR_NULL_HANDLE;
 XrSystemId    g_systemId = XR_NULL_SYSTEM_ID;
 XrSession     g_session  = XR_NULL_HANDLE;
-XrSpace       g_space    = XR_NULL_HANDLE;
+XrSpace       g_space    = XR_NULL_HANDLE;   // LOCAL (world) reference space
+XrSpace       g_viewSpace = XR_NULL_HANDLE;  // VIEW (head-locked) space for UI quad
+
+// Head-locked UI quad (terminals / menus / dialogs): a single mono swapchain
+// submitted as an XrCompositionLayerQuad - a true flat panel the compositor does
+// NOT reproject as 3D, so no ghost/smear like a projection layer gives for 2D.
+XrSwapchain g_uiSwapchain = XR_NULL_HANDLE;
+int32_t     g_uiW = 0, g_uiH = 0;
+std::vector<XrSwapchainImageOpenGLKHR> g_uiImages;
+GLuint      g_uiFbo = 0;
 
 const XrViewConfigurationType   g_viewType  = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 const XrEnvironmentBlendMode    g_blendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -222,7 +231,42 @@ bool CreateReferenceSpace()
     ci.poseInReferenceSpace.orientation.w = 1.0f;   // identity
     XrResult r = xrCreateReferenceSpace(g_session, &ci, &g_space);
     L("xrCreateReferenceSpace(LOCAL): %d", (int)r);
+    if (!XR_SUCCEEDED(r)) return false;
+
+    // VIEW space (head-locked) for the UI quad, so terminals/menus float in front
+    // of the face and follow head motion.
+    XrReferenceSpaceCreateInfo vci{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+    vci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    vci.poseInReferenceSpace.orientation.w = 1.0f;
+    r = xrCreateReferenceSpace(g_session, &vci, &g_viewSpace);
+    L("xrCreateReferenceSpace(VIEW): %d", (int)r);
     return XR_SUCCEEDED(r);
+}
+
+bool CreateUISwapchain()
+{
+    g_uiW = 1024; g_uiH = 1024;   // square; content letterboxed, quad sized to fit
+    XrSwapchainCreateInfo ci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
+    ci.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    ci.format      = g_colorFormat;
+    ci.sampleCount = 1;
+    ci.width       = g_uiW;
+    ci.height      = g_uiH;
+    ci.faceCount   = 1;
+    ci.arraySize   = 1;
+    ci.mipCount    = 1;
+    XrResult r = xrCreateSwapchain(g_session, &ci, &g_uiSwapchain);
+    L("xrCreateSwapchain(UI): %d (%dx%d)", (int)r, g_uiW, g_uiH);
+    if (!XR_SUCCEEDED(r)) return false;
+
+    uint32_t imageCount = 0;
+    xrEnumerateSwapchainImages(g_uiSwapchain, 0, &imageCount, nullptr);
+    g_uiImages.assign(imageCount, { XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR });
+    if (imageCount)
+        xrEnumerateSwapchainImages(g_uiSwapchain, imageCount, &imageCount,
+            (XrSwapchainImageBaseHeader*)g_uiImages.data());
+    L("  UI swapchain imageCount=%u", imageCount);
+    return imageCount > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +389,52 @@ bool RenderEyeImage(int eye, GLuint texture, int32_t w, int32_t h)
     return blitted;
 }
 
+// Fill the UI swapchain image (for the head-locked quad layer) with the mirrored
+// 2D content (terminal/map region, or the full frame), stretched to fill. Black
+// background, opaque alpha. Returns the CONTENT aspect (w/h) so the quad can be
+// sized to it (un-stretching the square swapchain -> no letterbox).
+double RenderUIImage(GLuint texture)
+{
+    GLint prevRead = 0, prevDraw = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDraw);
+    const GLboolean scissorWas = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_uiFbo);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_TEXTURE_2D, texture, 0);
+    glViewport(0, 0, g_uiW, g_uiH);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    double aspect = 1.0;
+    if (g_captureFbo && g_capW > 0 && g_capH > 0) {
+        int sx = 0, sy = 0, sw = g_capW, sh = g_capH;
+        if (g_mirrorRect[2] > 0 && g_mirrorRect[3] > 0) {
+            sx = g_mirrorRect[0]; sy = g_mirrorRect[1];
+            sw = g_mirrorRect[2]; sh = g_mirrorRect[3];
+        }
+        aspect = (double)sw / (double)sh;
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_captureFbo);
+        glDisable(GL_FRAMEBUFFER_SRGB);
+        glBlitFramebuffer(sx, sy, sx + sw, sy + sh, 0, 0, g_uiW, g_uiH,
+            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    }
+
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);   // force opaque alpha
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevRead);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prevDraw);
+    if (scissorWas) glEnable(GL_SCISSOR_TEST);
+    return aspect;
+}
+
 // Copy the current default framebuffer (the just-rendered monitor frame) into
 // our capture texture. Called before SDL_GL_SwapWindow, while the back buffer
 // still holds the frame.
@@ -411,14 +501,16 @@ bool Aleph_OpenXR_Init()
     if (!CreateInstanceAndSystem() ||
         !CreateSession() ||
         !CreateSwapchains() ||
-        !CreateReferenceSpace()) {
+        !CreateReferenceSpace() ||
+        !CreateUISwapchain()) {
         L("init: FAILED — tearing down");
         Aleph_OpenXR_Shutdown();
         return false;
     }
 
     glGenFramebuffers(1, &g_fbo);
-    L("scratch FBO=%u", g_fbo);
+    glGenFramebuffers(1, &g_uiFbo);
+    L("scratch FBO=%u uiFBO=%u", g_fbo, g_uiFbo);
 
     g_active = true;
     L("init: OK (session created; waiting for READY)");
@@ -446,6 +538,7 @@ void Aleph_OpenXR_Frame()
 
     std::vector<XrCompositionLayerProjectionView> projViews;
     XrCompositionLayerProjection layer{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+    XrCompositionLayerQuad       quadLayer{ XR_TYPE_COMPOSITION_LAYER_QUAD };
     const XrCompositionLayerBaseHeader* layers[1] = { nullptr };
     uint32_t layerCount = 0;
 
@@ -492,74 +585,89 @@ void Aleph_OpenXR_Frame()
         // we sanitize instead of skipping — the solid color then shows even
         // before/without full tracking (headset still establishing, on a desk).
         if (XR_SUCCEEDED(locateResult) && viewCountOut > 0) {
-            projViews.resize(viewCountOut);
-
-            // Mirror mode: no per-eye world render this frame (terminals, menus,
-            // dialogs, or tracking-loss fallback) -> both eyes show the SAME mono
-            // image. A projection layer normally wants a distinct per-eye pose+fov;
-            // feeding a mono image through that makes it render slightly different
-            // per eye -> a shifted/warped "ghost" beside the content. Give both
-            // eyes an IDENTICAL pose + symmetric fov so it fuses as one flat panel.
+            // No per-eye world render this frame (terminals, menus, dialogs, or
+            // tracking-loss fallback) -> present the 2D content as a HEAD-LOCKED
+            // QUAD layer, which the compositor draws as a true flat panel (no 3D
+            // reprojection ghost/smear). Otherwise render the world per eye into
+            // the stereo projection layer.
             const bool mirrorMode = (g_eyeSrcFbo[0] == 0 && g_eyeSrcFbo[1] == 0);
-            XrPosef commonPose = views[0].pose;
-            if (!orientationValid) commonPose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
-            if (!positionValid)    commonPose.position    = { 0.0f, 0.0f, 0.0f };
-            XrFovf commonFov = views[0].fov;
-            {
-                const float hh = 0.5f * (commonFov.angleRight - commonFov.angleLeft);
-                const float vv = 0.5f * (commonFov.angleUp - commonFov.angleDown);
-                commonFov.angleLeft = -hh; commonFov.angleRight = hh;
-                commonFov.angleUp   =  vv; commonFov.angleDown  = -vv;
-            }
 
-            for (uint32_t i = 0; i < viewCountOut; ++i) {
-                SwapchainInfo& sc = g_swapchains[i];
-
+            if (mirrorMode) {
                 uint32_t imgIndex = 0;
                 XrSwapchainImageAcquireInfo acq{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-                if (!XR_SUCCEEDED(xrAcquireSwapchainImage(sc.handle, &acq, &imgIndex)))
-                    continue;
+                if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_uiSwapchain, &acq, &imgIndex))) {
+                    XrSwapchainImageWaitInfo wait{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+                    wait.timeout = XR_INFINITE_DURATION;
+                    xrWaitSwapchainImage(g_uiSwapchain, &wait);
 
-                XrSwapchainImageWaitInfo wait{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-                wait.timeout = XR_INFINITE_DURATION;
-                xrWaitSwapchainImage(sc.handle, &wait);
+                    const double aspect = RenderUIImage(g_uiImages[imgIndex].image);
 
-                if (RenderEyeImage((int)i, sc.images[imgIndex].image,
-                                   sc.width, sc.height))
-                    ++mirrorEyes;
+                    XrSwapchainImageReleaseInfo rel{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+                    xrReleaseSwapchainImage(g_uiSwapchain, &rel);
 
-                XrSwapchainImageReleaseInfo rel{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-                xrReleaseSwapchainImage(sc.handle, &rel);
-                ++eyesRendered;
+                    const float D  = 2.0f;    // meters in front of the face
+                    const float QW = 1.6f;    // panel width in meters
+                    const float QH = (float)(QW / (aspect > 0.1 ? aspect : 1.0));
+                    quadLayer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+                    quadLayer.space         = g_viewSpace;   // head-locked
+                    quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                    quadLayer.subImage.swapchain        = g_uiSwapchain;
+                    quadLayer.subImage.imageArrayIndex  = 0;
+                    quadLayer.subImage.imageRect.offset = { 0, 0 };
+                    quadLayer.subImage.imageRect.extent = { g_uiW, g_uiH };
+                    quadLayer.pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+                    quadLayer.pose.position    = { 0.0f, 0.0f, -D };
+                    quadLayer.size = { QW, QH };
+                    layers[0]  = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quadLayer);
+                    layerCount = 1;
+                    mirrorEyes = 2;
+                }
+            } else {
+                projViews.resize(viewCountOut);
+                for (uint32_t i = 0; i < viewCountOut; ++i) {
+                    SwapchainInfo& sc = g_swapchains[i];
 
-                // Sanitize the pose so xrEndFrame always gets a valid quaternion.
-                XrPosef pose = views[i].pose;
-                if (!orientationValid)
-                    pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
-                if (!positionValid)
-                    pose.position = { 0.0f, 0.0f, 0.0f };
+                    uint32_t imgIndex = 0;
+                    XrSwapchainImageAcquireInfo acq{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+                    if (!XR_SUCCEEDED(xrAcquireSwapchainImage(sc.handle, &acq, &imgIndex)))
+                        continue;
 
-                XrCompositionLayerProjectionView& pv = projViews[i];
-                pv = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
-                if (mirrorMode) {
-                    pv.pose = commonPose;   // identical for both eyes -> fuses flat
-                    pv.fov  = commonFov;
-                } else {
+                    XrSwapchainImageWaitInfo wait{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+                    wait.timeout = XR_INFINITE_DURATION;
+                    xrWaitSwapchainImage(sc.handle, &wait);
+
+                    if (RenderEyeImage((int)i, sc.images[imgIndex].image,
+                                       sc.width, sc.height))
+                        ++mirrorEyes;
+
+                    XrSwapchainImageReleaseInfo rel{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+                    xrReleaseSwapchainImage(sc.handle, &rel);
+                    ++eyesRendered;
+
+                    // Sanitize the pose so xrEndFrame always gets a valid quaternion.
+                    XrPosef pose = views[i].pose;
+                    if (!orientationValid)
+                        pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+                    if (!positionValid)
+                        pose.position = { 0.0f, 0.0f, 0.0f };
+
+                    XrCompositionLayerProjectionView& pv = projViews[i];
+                    pv = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
                     pv.pose = pose;
                     pv.fov  = (i < 2 && g_eyeFovSet[i]) ? g_eyeFov[i] : views[i].fov;
+                    pv.subImage.swapchain               = sc.handle;
+                    pv.subImage.imageArrayIndex         = 0;
+                    pv.subImage.imageRect.offset        = { 0, 0 };
+                    pv.subImage.imageRect.extent.width  = sc.width;
+                    pv.subImage.imageRect.extent.height = sc.height;
                 }
-                pv.subImage.swapchain               = sc.handle;
-                pv.subImage.imageArrayIndex         = 0;
-                pv.subImage.imageRect.offset        = { 0, 0 };
-                pv.subImage.imageRect.extent.width  = sc.width;
-                pv.subImage.imageRect.extent.height = sc.height;
-            }
 
-            layer.space     = g_space;
-            layer.viewCount = (uint32_t)projViews.size();
-            layer.views     = projViews.data();
-            layers[0]       = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
-            layerCount      = 1;
+                layer.space     = g_space;
+                layer.viewCount = (uint32_t)projViews.size();
+                layer.views     = projViews.data();
+                layers[0]       = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
+                layerCount      = 1;
+            }
         }
     }
 
@@ -595,6 +703,7 @@ void Aleph_OpenXR_Frame()
 void Aleph_OpenXR_Shutdown()
 {
     if (g_fbo)        { glDeleteFramebuffers(1, &g_fbo);        g_fbo = 0; }
+    if (g_uiFbo)      { glDeleteFramebuffers(1, &g_uiFbo);      g_uiFbo = 0; }
     if (g_captureFbo) { glDeleteFramebuffers(1, &g_captureFbo); g_captureFbo = 0; }
     if (g_captureTex) { glDeleteTextures(1, &g_captureTex);     g_captureTex = 0; }
     g_capW = g_capH = 0;
@@ -608,7 +717,10 @@ void Aleph_OpenXR_Shutdown()
         if (sc.handle != XR_NULL_HANDLE) xrDestroySwapchain(sc.handle);
     g_swapchains.clear();
     g_configViews.clear();
+    if (g_uiSwapchain != XR_NULL_HANDLE) { xrDestroySwapchain(g_uiSwapchain); g_uiSwapchain = XR_NULL_HANDLE; }
+    g_uiImages.clear();
 
+    if (g_viewSpace != XR_NULL_HANDLE) { xrDestroySpace(g_viewSpace); g_viewSpace = XR_NULL_HANDLE; }
     if (g_space   != XR_NULL_HANDLE) { xrDestroySpace(g_space);      g_space   = XR_NULL_HANDLE; }
     if (g_session != XR_NULL_HANDLE) { xrDestroySession(g_session);  g_session = XR_NULL_HANDLE; }
     if (g_instance!= XR_NULL_HANDLE) { xrDestroyInstance(g_instance);g_instance= XR_NULL_HANDLE; }

@@ -3,7 +3,7 @@
 // =====================================================================
 // CURRENT STATE / RESUME HERE   (update at the end of each milestone)
 // ---------------------------------------------------------------------
-// Last updated: 2026-08-05, Step C2 in progress (BOTH eyes head-tracked).
+// Last updated: 2026-08-07, Step C2 (both eyes + 2D-overlay quad layer).
 // Branch: vr-mod
 //
 // Verified working:
@@ -26,33 +26,24 @@
 //     the clamp treated it as signed and slammed it to +PITCH_LIMIT (straight
 //     up). Now converted to signed before clamping (screen.cpp).
 //   - 2D OVERLAYS (terminals, overhead map, menus, dialogs, save screen) in
-//     headset: mirror the monitor as a fused mono PANEL. In terminal/map mode
-//     RenderEyes() clears the per-eye world source and crops the mirror to just
-//     the terminal/map REGION, centered + scaled (PANEL ~0.65). In Frame(), any
-//     "mirror" frame (no per-eye world source) submits BOTH eyes IDENTICALLY -
-//     same pose + symmetric fov - so the mono image fuses instead of doubling.
-//     Also: force swapchain alpha opaque (2D blits carry alpha<1 -> compositor
-//     shows them see-through), scissor disabled around the blit. READABLE and
-//     mostly fused, BUT see open issue #1 (residual ghost/smear).
+//     headset: shown as a HEAD-LOCKED QUAD LAYER (XrCompositionLayerQuad) -- the
+//     correct flat-panel layer, drawn crisply by the compositor with NO 3D
+//     reprojection ghost/smear (which the old projection-layer approach couldn't
+//     avoid). In "mirror" frames (no per-eye world source) Frame() renders the
+//     cropped 2D region into a dedicated mono UI swapchain (RenderUIImage, black
+//     bg + opaque alpha) and submits a quad in VIEW space at (0,0,-2 m), sized to
+//     the content aspect (D=2 m, width 1.6 m). Confirmed clean + well placed.
+//     (Terminal/map region crop is set by screen.cpp Aleph_OpenXR_SetMirrorSrcRect.)
 //
-// OPEN ISSUES (C2 polish / C3), next up:
-//   1. 2D OVERLAY GHOST/SMEAR (next task): mirrored terminals/menus still show a
-//      faint ghost that "blasts out the sides" and flickers at the edges. Root
-//      cause: we submit flat 2D through a PROJECTION LAYER, which the compositor
-//      reprojects as if it had 3D depth -> flat content smears. Matching per-eye
-//      pose+fov, symmetric fov, opaque alpha, and scissor all helped but can't
-//      fully fix it - wrong layer TYPE for 2D. PROPER FIX: XrCompositionLayerQuad
-//      (a dedicated flat-panel layer). Plan: add a mono UI swapchain + a scratch
-//      FBO, render the cropped 2D content into it, create a VIEW-reference space,
-//      and in mirror mode submit a head-locked quad (pose ~ (0,0,-2 m), sized to
-//      the UI aspect) INSTEAD of the projection layer. Expect 1-2 iterations to
-//      tune distance/size.
-//   2. AIMING (head-yaw): view = facing + head_yaw but the gun uses facing, so
+// OPEN ISSUES (C2 polish / C3 / later), next up:
+//   1. AIMING (head-yaw): view = facing + head_yaw but the gun uses facing, so
 //      turning your head puts the gun off view-center horizontally ("sometimes
-//      off"). Fix: cap head-yaw's influence, or "head drives the gun" (C3).
-//   3. HEAD TRACKING positional: rotation-only + FIXED IPD, NO translational
+//      off"). Fix: cap head-yaw's influence, or "head drives the gun".
+//   2. HEAD TRACKING positional: rotation-only + FIXED IPD, NO translational
 //      tracking (leaning/moving your head doesn't move the camera). Wanted 6DoF.
-//   4. NEAR-object DOUBLE VISION: inherent VR near-fusion limit; later IPD tune.
+//   3. NEAR-object DOUBLE VISION: inherent VR near-fusion limit; later IPD tune.
+//   4. VR-NATIVE MENUS: the quit/save/etc. dialogs work as mirrored quads but are
+//      still 2D-monitor menus; real VR menu layout/interaction is a later job.
 //   (Plus from C1: perf DEGRADES after ~5 min -> C3 pacing, single-threaded
 //    3x world render + blocking xrWaitFrame.)
 //
