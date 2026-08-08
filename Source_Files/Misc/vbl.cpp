@@ -88,6 +88,9 @@ Feb 20, 2002 (Woody Zenfell):
 #include "preferences.h"
 #include "Logging.h"
 #include "mouse.h"
+#if defined(__WIN32__) && defined(HAVE_OPENGL)
+#include "OpenXR_Session.h"
+#endif
 #include "player.h"
 #include "key_definitions.h"
 #include "tags.h"
@@ -1311,7 +1314,19 @@ uint32 parse_keymap(void)
 	  }
 
 	  if (input_preferences->input_device == _mouse_yaw_pitch) {
-		  flags = process_aim_input(flags, pull_mouselook_delta());
+		  fixed_yaw_pitch aim_delta = pull_mouselook_delta();
+#if defined(__WIN32__) && defined(HAVE_OPENGL)
+		  // Head-drives-gun: fold this tick's head rotation into the aim so the
+		  // player's facing (and the gun) follows the head. No-op when the OpenXR
+		  // session is inactive, so the plain mouse path is unchanged.
+		  if (Aleph_OpenXR_IsActive()) {
+			  int hdy = 0, hdp = 0;
+			  Aleph_OpenXR_PullHeadAimDelta(&hdy, &hdp);
+			  aim_delta.yaw   += hdy;
+			  aim_delta.pitch += hdp;
+		  }
+#endif
+		  flags = process_aim_input(flags, aim_delta);
 	  }
 
 	  flags = process_joystick_axes(flags);

@@ -55,6 +55,16 @@ void Aleph_OpenXR_SetEyeFov(int eye, float angleLeft, float angleRight,
 // Append a line to the OpenXR log (openxr_session.txt). For host-side debug.
 void Aleph_OpenXR_LogLine(const char* msg);
 
+// --- Head-drives-gun ------------------------------------------------------
+// PullHeadAimDelta: per-tick head rotation since the last call, in fixed_angle
+//   units, to add to the mouse aim delta (drives the player's facing so the gun
+//   follows the head). Consumes the motion. Call ONCE per game tick.
+// GetHeadResidual: per-render sub-tick head motion not yet in the facing, in
+//   angle units, to add to the view so head tracking stays smooth. Both return
+//   false (and zeroes) when the session is inactive or no pose is available.
+bool Aleph_OpenXR_PullHeadAimDelta(int* dyawFixed, int* dpitchFixed);
+bool Aleph_OpenXR_GetHeadResidual(int* ryaw, int* rpitch);
+
 // When mirroring the monitor into the eyes (terminals / overhead map), blit only
 // this sub-region of the captured frame, fit + centered in the eye, instead of
 // the whole stretched frame. Coords are in captured-framebuffer pixels with GL

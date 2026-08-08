@@ -26,6 +26,7 @@
 
 #include <cstdio>
 #include <cstdarg>
+#include <cmath>
 #include <vector>
 
 // GL internal color formats reported by the runtime (avoid extra headers).
@@ -90,6 +91,61 @@ int    g_cycle      = 0;   // Init count this process (detects re-init churn)
 long   g_frameNum   = 0;   // frames since this cycle began rendering
 long   g_inGameLogN = 0;   // frames logged where a host eye source was present
 bool   g_logThisFrame = false;
+
+// Head-drives-gun (head aim). Marathon angle units: 512 = full circle;
+// fixed_angle = angle << 16. We keep these as literals so this file needs no
+// game headers. Signs are tunable (verify in-headset). +1 assumes head-right ->
+// facing-right and head-up -> looking-up, matching the previous view convention.
+const double XR_ANGLES_PER_CIRCLE   = 512.0;
+const double XR_FIXED_ONE_D         = 65536.0;
+const double XR_HEAD_YAW_SIGN        = +1.0;
+const double XR_HEAD_PITCH_SIGN      = +1.0;
+const double XR_HEAD_AIM_YAW_SIGN    = +1.0;   // aim delta sign (independent)
+const double XR_HEAD_AIM_PITCH_SIGN  = +1.0;
+// Light low-pass on the head angle: weight of the NEW sample each render frame
+// (1.0 = no smoothing, lower = smoother but more lag). Kills raw-pose micro-
+// jitter. Applied to BOTH the view and the aim so they stay in sync.
+const double XR_HEAD_SMOOTH           = 0.5;
+bool   g_headInit     = false;
+double g_headSmYaw    = 0.0;   // smoothed head angle (angle units) - authoritative
+double g_headSmPitch  = 0.0;
+double g_headYawRef   = 0.0;   // smoothed head already folded into the facing
+double g_headPitchRef = 0.0;
+
+// Current head yaw/pitch (ANGLE UNITS) from the latest located eye-0 pose.
+bool XR_HeadAngles(double* yaw, double* pitch)
+{
+    float q[4], p[3], f[4];
+    if (!Aleph_OpenXR_GetEyePose(0, q, p, f)) return false;
+    const float qx = q[0], qy = q[1], qz = q[2], qw = q[3];
+    const float fwx = -2.0f * (qx * qz + qw * qy);
+    float       fwy = -2.0f * (qy * qz - qw * qx);
+    const float fwz = -(1.0f - 2.0f * (qx * qx + qy * qy));
+    if (fwy >  1.0f) fwy =  1.0f;
+    if (fwy < -1.0f) fwy = -1.0f;
+    const double TU = XR_ANGLES_PER_CIRCLE / (2.0 * 3.14159265358979323846);
+    *yaw   = std::atan2((double)fwx, (double)(-fwz)) * TU * XR_HEAD_YAW_SIGN;
+    *pitch = std::asin((double)fwy) * TU * XR_HEAD_PITCH_SIGN;
+    return true;
+}
+
+// Advance the smoothed head angle from the current raw pose. Called once per
+// render frame so the low-pass runs at a consistent (display) rate; the aim path
+// just reads the result. Returns false if no pose is available.
+bool XR_AdvanceSmoothHead()
+{
+    double hy, hp;
+    if (!XR_HeadAngles(&hy, &hp)) return false;
+    if (!g_headInit) {
+        g_headSmYaw = hy; g_headSmPitch = hp;
+        g_headYawRef = hy; g_headPitchRef = hp;   // seed reference (no initial jump)
+        g_headInit = true;
+        return true;
+    }
+    g_headSmYaw   += XR_HEAD_SMOOTH * (hy - g_headSmYaw);
+    g_headSmPitch += XR_HEAD_SMOOTH * (hp - g_headSmPitch);
+    return true;
+}
 
 void L(const char* fmt, ...)
 {
@@ -710,6 +766,7 @@ void Aleph_OpenXR_Shutdown()
 
     g_lastViewValid[0] = g_lastViewValid[1] = false;
     g_eyeSrcFbo[0] = g_eyeSrcFbo[1] = 0;
+    g_headInit = false;   // re-seed head-aim reference + smoothing on next session
 
     if (g_sessionRunning) { xrEndSession(g_session); g_sessionRunning = false; }
 
@@ -790,4 +847,39 @@ void Aleph_OpenXR_SetMirrorSrcRect(int x, int y, int w, int h)
 {
     g_mirrorRect[0] = x; g_mirrorRect[1] = y;
     g_mirrorRect[2] = w; g_mirrorRect[3] = h;
+}
+
+// --- Head-drives-gun ------------------------------------------------------
+
+// Per-tick: how much the head rotated since the last call, in fixed_angle units,
+// for the aim pipeline (facing/elevation). Consumes the motion (advances the
+// reference) so the sub-tick remainder is left for the view residual. Call ONCE
+// per game tick alongside the mouse aim delta.
+bool Aleph_OpenXR_PullHeadAimDelta(int* dyawFixed, int* dpitchFixed)
+{
+    if (dyawFixed)   *dyawFixed   = 0;
+    if (dpitchFixed) *dpitchFixed = 0;
+    if (!g_active) return false;
+    if (!g_headInit) { XR_AdvanceSmoothHead(); return false; }  // seed; no delta yet
+    // Use the smoothed head (advanced per render frame in GetHeadResidual).
+    const double ddy = g_headSmYaw   - g_headYawRef;
+    const double ddp = g_headSmPitch - g_headPitchRef;
+    g_headYawRef   = g_headSmYaw;
+    g_headPitchRef = g_headSmPitch;
+    if (dyawFixed)   *dyawFixed   = (int)std::lround(ddy * XR_FIXED_ONE_D * XR_HEAD_AIM_YAW_SIGN);
+    if (dpitchFixed) *dpitchFixed = (int)std::lround(ddp * XR_FIXED_ONE_D * XR_HEAD_AIM_PITCH_SIGN);
+    return true;
+}
+
+// Per-render: advances the smoothed head, then returns the head motion since the
+// last tick that isn't in the facing yet (angle units). Added to the view so head
+// tracking stays smooth at display rate.
+bool Aleph_OpenXR_GetHeadResidual(int* ryaw, int* rpitch)
+{
+    if (ryaw)   *ryaw   = 0;
+    if (rpitch) *rpitch = 0;
+    if (!g_active || !XR_AdvanceSmoothHead()) return false;
+    if (ryaw)   *ryaw   = (int)std::lround(g_headSmYaw   - g_headYawRef);
+    if (rpitch) *rpitch = (int)std::lround(g_headSmPitch - g_headPitchRef);
+    return true;
 }

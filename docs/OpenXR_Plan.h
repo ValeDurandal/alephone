@@ -35,17 +35,29 @@
 //     the content aspect (D=2 m, width 1.6 m). Confirmed clean + well placed.
 //     (Terminal/map region crop is set by screen.cpp Aleph_OpenXR_SetMirrorSrcRect.)
 //
-// Aiming (head-yaw): DONE for now. The head-yaw influence on the view is now
-//   CAPPED (HEAD_YAW_ASSIST_CAP ~16 units / ~11 deg in screen.cpp), matching the
-//   pitch assist, so the view stays near the player's facing and the gun sits at
-//   view center. Confirmed: aiming is accurate (hits everything but strafers).
+// HEAD-DRIVES-GUN: DONE and verified in-headset. The head's per-tick rotation is
+//   folded into the aim pipeline (vbl.cpp process_aim_input, gated on XR-active)
+//   so the head turns the player's FACING/elevation and the gun follows the head.
+//   The VIEW = facing + sub-tick head RESIDUAL (OpenXR_Session PullHeadAimDelta /
+//   GetHeadResidual) so head-look stays smooth at display rate while the gun lags
+//   <= one 30Hz tick. Signs/scale verified: head-left->world-left, head-down->view
+//   -down, shots land exactly where looking, ~1:1 turn scale. Replaced the
+//   capped-head-yaw + pitch-assist view code. Mouse still adds on top. (Head-aim
+//   signs XR_HEAD_*_SIGN live in OpenXR_Session.cpp; the mouse-only path is
+//   unchanged when XR is inactive.)
+//
+// Head-angle smoothing: DONE. A light low-pass (EMA, XR_HEAD_SMOOTH ~0.5 in
+//   OpenXR_Session) on the head angle removes raw-pose micro-jitter, applied to
+//   BOTH the view and the aim so they stay in sync. Confirmed comfortable
+//   (reached level 3). View-bob is handled by the existing Preferences > Graphics
+//   > View Bobbing setting (turn off for VR); no code change needed.
 //
 // OPEN ISSUES (C3 / later), next up:
-//   1. HEAD-DRIVES-GUN (wanted): the user wants MORE head look-around, but raising
-//      the yaw cap drifts the aim. The real fix is to feed head yaw/pitch into the
-//      player's FACING/elevation (a controls/input change, not render) so the gun
-//      follows the head -> full free head-look AND accurate aim. This subsumes the
-//      yaw-cap and the pitch view-follows-aim once done.
+//   1. PITCH RANGE limited (~45 deg up/down): bounded by the renderer (horizon
+//      can't leave the image -> PITCH_LIMIT ~0.9*vhalf) and/or the physics
+//      maximum_elevation. Extending needs a bigger vertical FOV render and/or a
+//      larger maximum_elevation; full straight-down isn't possible in the BSP
+//      renderer. Could let the VIEW pitch exceed the gun's at the extreme.
 //   2. HEAD TRACKING positional: rotation-only + FIXED IPD, NO translational
 //      tracking (leaning/moving your head doesn't move the camera). Wanted 6DoF.
 //   3. NEAR-object DOUBLE VISION: inherent VR near-fusion limit; later IPD tune.

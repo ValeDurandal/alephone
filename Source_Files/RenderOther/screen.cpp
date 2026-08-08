@@ -1351,8 +1351,7 @@ static void Aleph_OpenXR_RenderEyes()
 	}
 
 	// --- Tunables (adjust by feel in-headset) ---
-	const int    YAW_SIGN        = +1;
-	const int    PITCH_SIGN      = +1;
+	// (head yaw/pitch signs now live in OpenXR_Session's head-aim code)
 	const int    SEP_SIGN        = +1;      // flip if the eyes are swapped
 	// Stereo separation scale, tuned by feel in-headset:
 	//   too large  -> near objects won't fuse (eye strain), world feels tiny;
@@ -1361,54 +1360,26 @@ static void Aleph_OpenXR_RenderEyes()
 	const double XR_WU_PER_METER = 1024.0;
 	const double PI = 3.14159265358979323846;
 
-	// --- head orientation from eye 0 (both eyes share it) ---
-	const float qx = q0[0], qy = q0[1], qz = q0[2], qw = q0[3];
-	const float fwx = -2.0f * (qx * qz + qw * qy);
-	float       fwy = -2.0f * (qy * qz - qw * qx);
-	const float fwz = -(1.0f - 2.0f * (qx * qx + qy * qy));
-	if (fwy >  1.0f) fwy =  1.0f;
-	if (fwy < -1.0f) fwy = -1.0f;
+	// --- HEAD-DRIVES-GUN view ---
+	// The head now turns the player's facing/elevation through the aim pipeline
+	// (see vbl.cpp process_aim_input injection), so the gun follows the head. The
+	// VIEW just follows the facing plus the sub-tick head RESIDUAL (head motion
+	// not yet folded into the facing) so head tracking stays smooth at display
+	// rate while the gun (facing) lags by at most one 30Hz tick.
+	int res_yaw = 0, res_pitch = 0;
+	Aleph_OpenXR_GetHeadResidual(&res_yaw, &res_pitch);
+
+	const angle new_yaw = NORMALIZE_ANGLE(world_view->yaw + res_yaw);
+
+	// Pitch: world_view->pitch (facing elevation) is stored NORMALIZED [0,512) --
+	// looking DOWN 43 deg is 469, not -43. Convert to SIGNED before adding the
+	// residual and clamping (else "down" reads as a huge up-angle and slams the
+	// view straight up). Clamp to +/- the vertical half-FOV so the horizon can't
+	// leave the image (past that the renderer breaks), then re-normalize.
 	const double to_units = (double)NUMBER_OF_ANGLES / (2.0 * PI);
-	angle head_yaw   = (angle)(lround(atan2((double)fwx, (double)(-fwz)) * to_units) * YAW_SIGN);
-	angle head_pitch = (angle)(lround(asin((double)fwy) * to_units) * PITCH_SIGN);
-
-	// No host-side smoothing/rejection: the OpenXR runtime already predicts and
-	// smooths the head pose. Filtering on top of it fought the (slightly uneven,
-	// over Air Link) pose updates and caused constant stutter/jerking. Trust the
-	// raw pose - this is how VR head tracking is normally driven.
-
-	// VIEW FOLLOWS AIM (yaw): the gun fires along the player's facing (set by the
-	// mouse), so CAP how far the head-yaw pulls the view off it -> the gun stays
-	// near view center horizontally ("looking == shooting"). You turn/aim with the
-	// mouse; the head gives a small glance. Raise the cap for more head freedom at
-	// the cost of aim drift; lower it to lock the view tighter to the aim. (Full
-	// free head-look with accurate aim needs "head drives the gun" - feeding head
-	// yaw into the player's facing - a controls change, deferred.)
-	const int HEAD_YAW_ASSIST_CAP = 16;   // ~11 deg
-	int yaw_assist = head_yaw;
-	if (yaw_assist >  HEAD_YAW_ASSIST_CAP) yaw_assist =  HEAD_YAW_ASSIST_CAP;
-	if (yaw_assist < -HEAD_YAW_ASSIST_CAP) yaw_assist = -HEAD_YAW_ASSIST_CAP;
-	const angle new_yaw = NORMALIZE_ANGLE(world_view->yaw + yaw_assist);
-
-	// VIEW FOLLOWS AIM (while XR is active): the gun fires along the player's aim
-	// (mouse elevation), so we base the view pitch on that -> the crosshair/gun
-	// sits at view center and looking == shooting. A small CAPPED head-pitch
-	// "assist" keeps a touch of VR head response without letting the view drift
-	// far from where the gun points. Set the cap to 0 to lock fully to aim.
-	const int HEAD_PITCH_ASSIST_CAP = 10;   // ~7 deg
-	int assist = head_pitch;                // head_pitch is signed [-128,128]
-	if (assist >  HEAD_PITCH_ASSIST_CAP) assist =  HEAD_PITCH_ASSIST_CAP;
-	if (assist < -HEAD_PITCH_ASSIST_CAP) assist = -HEAD_PITCH_ASSIST_CAP;
-
-	// CRITICAL: world_view->pitch (the player's aim) is stored NORMALIZED to
-	// [0,512): looking DOWN 43 deg is 469, not -43. Convert to SIGNED before
-	// clamping, or the clamp reads "down" as a huge up-angle and slams the view
-	// to +PITCH_LIMIT (straight up) the moment you aim down -> the pitch-down
-	// glitch. Clamp in signed space to +/- the vertical half-FOV (past that the
-	// horizon leaves the image and the renderer breaks), then re-normalize.
 	int aim_signed = (int)world_view->pitch;
 	if (aim_signed >= NUMBER_OF_ANGLES / 2) aim_signed -= NUMBER_OF_ANGLES;
-	int np_signed = aim_signed + assist;
+	int np_signed = aim_signed + res_pitch;
 
 	double vhalf = 0.5 * ((double)f0[2] - (double)f0[3]);   // vertical half-FOV (rad)
 	if (vhalf < 0.35) vhalf = 0.35;
