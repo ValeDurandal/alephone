@@ -1376,7 +1376,19 @@ static void Aleph_OpenXR_RenderEyes()
 	// smooths the head pose. Filtering on top of it fought the (slightly uneven,
 	// over Air Link) pose updates and caused constant stutter/jerking. Trust the
 	// raw pose - this is how VR head tracking is normally driven.
-	const angle new_yaw = NORMALIZE_ANGLE(world_view->yaw + head_yaw);
+
+	// VIEW FOLLOWS AIM (yaw): the gun fires along the player's facing (set by the
+	// mouse), so CAP how far the head-yaw pulls the view off it -> the gun stays
+	// near view center horizontally ("looking == shooting"). You turn/aim with the
+	// mouse; the head gives a small glance. Raise the cap for more head freedom at
+	// the cost of aim drift; lower it to lock the view tighter to the aim. (Full
+	// free head-look with accurate aim needs "head drives the gun" - feeding head
+	// yaw into the player's facing - a controls change, deferred.)
+	const int HEAD_YAW_ASSIST_CAP = 16;   // ~11 deg
+	int yaw_assist = head_yaw;
+	if (yaw_assist >  HEAD_YAW_ASSIST_CAP) yaw_assist =  HEAD_YAW_ASSIST_CAP;
+	if (yaw_assist < -HEAD_YAW_ASSIST_CAP) yaw_assist = -HEAD_YAW_ASSIST_CAP;
+	const angle new_yaw = NORMALIZE_ANGLE(world_view->yaw + yaw_assist);
 
 	// VIEW FOLLOWS AIM (while XR is active): the gun fires along the player's aim
 	// (mouse elevation), so we base the view pitch on that -> the crosshair/gun

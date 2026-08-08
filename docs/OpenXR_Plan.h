@@ -35,10 +35,17 @@
 //     the content aspect (D=2 m, width 1.6 m). Confirmed clean + well placed.
 //     (Terminal/map region crop is set by screen.cpp Aleph_OpenXR_SetMirrorSrcRect.)
 //
-// OPEN ISSUES (C2 polish / C3 / later), next up:
-//   1. AIMING (head-yaw): view = facing + head_yaw but the gun uses facing, so
-//      turning your head puts the gun off view-center horizontally ("sometimes
-//      off"). Fix: cap head-yaw's influence, or "head drives the gun".
+// Aiming (head-yaw): DONE for now. The head-yaw influence on the view is now
+//   CAPPED (HEAD_YAW_ASSIST_CAP ~16 units / ~11 deg in screen.cpp), matching the
+//   pitch assist, so the view stays near the player's facing and the gun sits at
+//   view center. Confirmed: aiming is accurate (hits everything but strafers).
+//
+// OPEN ISSUES (C3 / later), next up:
+//   1. HEAD-DRIVES-GUN (wanted): the user wants MORE head look-around, but raising
+//      the yaw cap drifts the aim. The real fix is to feed head yaw/pitch into the
+//      player's FACING/elevation (a controls/input change, not render) so the gun
+//      follows the head -> full free head-look AND accurate aim. This subsumes the
+//      yaw-cap and the pitch view-follows-aim once done.
 //   2. HEAD TRACKING positional: rotation-only + FIXED IPD, NO translational
 //      tracking (leaning/moving your head doesn't move the camera). Wanted 6DoF.
 //   3. NEAR-object DOUBLE VISION: inherent VR near-fusion limit; later IPD tune.
